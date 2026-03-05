@@ -1,18 +1,50 @@
 /*
- * ═══════════════════════════════════════════════════════════════
- * CoMotion Tracker — SD Card Logging
- * ═══════════════════════════════════════════════════════════════
+ * CoMotion Tracker — SD Card Module
+ *
+ * Mount/unmount FAT filesystem on external SD card (SPI).
+ * Write sensor data as CSV log files.
  */
-#ifndef COMOTION_SDCARD_H
-#define COMOTION_SDCARD_H
 
-#include "common.h"
+#ifndef SDCARD_H
+#define SDCARD_H
 
-int  sdcard_init(void);
-bool sdcard_start_logging(void);
-void sdcard_stop_logging(void);
-void sdcard_log_sample(int64_t timestamp);
-void sdcard_flush(void);
-void sdcard_mark_event(const char *name);
+#include <stdint.h>
+#include <stdbool.h>
 
-#endif
+/**
+ * Initialize the SD card subsystem: check disk, mount FAT FS.
+ *
+ * @return 0 on success, negative errno on failure
+ */
+int sdcard_init(void);
+
+/**
+ * Check if SD card is mounted and ready.
+ */
+bool sdcard_is_mounted(void);
+
+/**
+ * Write a line of text to the current log file.
+ * Creates the file on first call.
+ *
+ * @param line  Null-terminated string to write (newline appended automatically)
+ * @return 0 on success, negative errno on failure
+ */
+int sdcard_write_line(const char *line);
+
+/**
+ * Flush buffered data to the SD card.
+ * Call periodically to avoid data loss.
+ *
+ * @return 0 on success, negative errno on failure
+ */
+int sdcard_flush(void);
+
+/**
+ * Close the log file and unmount the filesystem.
+ *
+ * @return 0 on success, negative errno on failure
+ */
+int sdcard_close(void);
+
+#endif /* SDCARD_H */

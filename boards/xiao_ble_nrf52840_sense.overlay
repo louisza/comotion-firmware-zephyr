@@ -1,55 +1,63 @@
-/*
- * CoMotion Tracker — Device Tree Overlay
- * Board: xiao_ble/nrf52840/sense
- *
- * GPS: ATGM332D on UART1 (TX=D6/P1.11, RX=D7/P1.12) at 9600 baud
- * SD Card: SPI2 with CS on D2 (P0.28)
- */
+﻿/* CoMotion Tracker - Step 7: GPS + PDM Mic + SD Card + Battery ADC */
 
-/* ─── GPS UART on D6(TX) / D7(RX) ─── */
-&pinctrl {
-	uart1_default: uart1_default {
-		group1 {
-			psels = <NRF_PSEL(UART_TX, 1, 11)>,   /* D6 = P1.11 */
-			        <NRF_PSEL(UART_RX, 1, 12)>;    /* D7 = P1.12 */
-		};
-	};
-
-	uart1_sleep: uart1_sleep {
-		group1 {
-			psels = <NRF_PSEL(UART_TX, 1, 11)>,
-			        <NRF_PSEL(UART_RX, 1, 12)>;
-			low-power-enable;
-		};
+/* Battery voltage divider: VBATT → 1MΩ → P0.31 (AIN7) → 510KΩ → P0.14 */
+/ {
+	vbatt: vbatt {
+		compatible = "voltage-divider";
+		io-channels = <&adc 7>;
+		output-ohms = <510000>;
+		full-ohms = <(1000000 + 510000)>;
 	};
 };
 
-&uart1 {
-	compatible = "nordic,nrf-uarte";
-	status = "okay";
+&adc {
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	channel@7 {
+		reg = <7>;
+		zephyr,gain = "ADC_GAIN_1_6";
+		zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
+		zephyr,input-positive = <NRF_SAADC_AIN7>;
+		zephyr,resolution = <12>;
+	};
+};
+
+/* ATGM332D GPS on UART0 (P1.11 TX / P1.12 RX — already assigned by board) */
+&uart0 {
 	current-speed = <9600>;
-	pinctrl-0 = <&uart1_default>;
-	pinctrl-1 = <&uart1_sleep>;
-	pinctrl-names = "default", "sleep";
+
+	gnss: gnss-nmea-generic {
+		compatible = "gnss-nmea-generic";
+	};
 };
 
-/* ─── SD Card on SPI2, CS = D2 (P0.28) ─── */
-&spi2 {
+/* PDM microphone: enable power regulator (P1.10) at boot */
+/ {
+	msm261d3526hicpm-c-en {
+		regulator-boot-on;
+	};
+};
+
+/* PDM microphone: enable peripheral (pinctrl already in board DTS) */
+dmic_dev: &pdm0 {
 	status = "okay";
+};
+
+/* SD Card on SPI2 (SCK=P1.13, MOSI=P1.15, MISO=P1.14), CS=P0.28 (XIAO D2) */
+&spi2 {
 	cs-gpios = <&gpio0 28 GPIO_ACTIVE_LOW>;
 
 	sdhc0: sdhc@0 {
 		compatible = "zephyr,sdhc-spi-slot";
 		reg = <0>;
+		status = "okay";
 		spi-max-frequency = <8000000>;
 		mmc {
 			compatible = "zephyr,sdmmc-disk";
+			disk-name = "SD";
 			status = "okay";
 		};
 	};
-};
-
-/* ─── Enable PDM (already partially in board DTS, ensure status) ─── */
-&pdm0 {
-	status = "okay";
 };

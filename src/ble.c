@@ -125,7 +125,7 @@ static int create_legacy_adv(void)
 {
 	int err;
 	struct bt_le_adv_param param = BT_LE_ADV_PARAM_INIT(
-		BT_LE_ADV_OPT_CONNECTABLE | BT_LE_ADV_OPT_EXT_ADV,
+		BT_LE_ADV_OPT_CONN | BT_LE_ADV_OPT_EXT_ADV,
 		800, 800, /* 500ms interval (800 × 0.625ms) */
 		NULL);
 

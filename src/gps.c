@@ -1,188 +1,97 @@
 /*
- * ═══════════════════════════════════════════════════════════════
- * CoMotion Tracker — GPS (UART + NMEA Parser)
+ * CoMotion Tracker - GPS Module (ATGM332D via Zephyr GNSS framework)
  *
- * ATGM332D on UART1, 9600 baud
- * NMEA parser copied verbatim from Arduino firmware.
- * ═══════════════════════════════════════════════════════════════
+ * Uses the built-in gnss-nmea-generic driver which handles:
+ *   - UART interrupt-driven receive
+ *   - NMEA sentence parsing (RMC, GGA, GSV)
+ *   - Structured data output via callback
+ *
+ * We just register a callback and store the latest fix.
  */
 
-#include <zephyr/drivers/uart.h>
-#include <zephyr/logging/log.h>
-#include <stdlib.h>
-#include <string.h>
-#include <math.h>
-
-#include "common.h"
 #include "gps.h"
 
-LOG_MODULE_REGISTER(gps, LOG_LEVEL_INF);
+#include <zephyr/kernel.h>
+#include <zephyr/device.h>
+#include <zephyr/drivers/gnss.h>
+#include <stdio.h>
 
-static const struct device *gps_uart;
-static char nmea_buf[100];
-static int  nmea_idx;
+/* Latest fix — protected by a spinlock since callback runs from modem thread */
+static struct k_spinlock gps_lock;
+static struct gps_data latest;
+static bool data_valid;
+static uint32_t update_count;
 
-/* ─── Forward declarations ─── */
-static void parse_nmea_char(char c);
-static void parse_nmea_sentence(void);
-static bool validate_checksum(void);
-static void parse_rmc(void);
-static void parse_gga(void);
-
-/* ═══════════════════════════════════════════════════════════════
- * UART IRQ Callback
- * ═══════════════════════════════════════════════════════════════ */
-
-static void gps_uart_cb(const struct device *dev, void *user_data)
+/* Called by the GNSS framework whenever a new NMEA fix/update is parsed */
+static void gnss_data_cb(const struct device *dev, const struct gnss_data *data)
 {
-	uint8_t c;
+	k_spinlock_key_t key = k_spin_lock(&gps_lock);
 
-	if (!uart_irq_update(dev)) return;
+	latest.has_fix = (data->info.fix_status != GNSS_FIX_STATUS_NO_FIX);
+	latest.latitude_ndeg = data->nav_data.latitude;
+	latest.longitude_ndeg = data->nav_data.longitude;
+	latest.altitude_mm = data->nav_data.altitude;
+	latest.speed_mmps = data->nav_data.speed;
+	latest.satellites = data->info.satellites_cnt;
+	latest.hour = data->utc.hour;
+	latest.minute = data->utc.minute;
+	latest.second = (uint8_t)(data->utc.millisecond / 1000);
+	data_valid = true;
+	update_count++;
 
-	while (uart_irq_rx_ready(dev)) {
-		if (uart_fifo_read(dev, &c, 1) == 1) {
-			parse_nmea_char((char)c);
-		}
-	}
+	k_spin_unlock(&gps_lock, key);
 }
 
-/* ═══════════════════════════════════════════════════════════════
- * Init
- * ═══════════════════════════════════════════════════════════════ */
+/* Pass the DT_GET directly — the macro needs a compile-time constant */
+GNSS_DATA_CALLBACK_DEFINE(DEVICE_DT_GET(DT_NODELABEL(gnss)), gnss_data_cb);
 
-int gps_init(void)
+int gps_get_data(struct gps_data *out)
 {
-	gps_uart = DEVICE_DT_GET(DT_NODELABEL(uart1));
-	if (!device_is_ready(gps_uart)) {
-		LOG_ERR("UART1 not ready");
-		return -ENODEV;
+	k_spinlock_key_t key = k_spin_lock(&gps_lock);
+
+	if (!data_valid) {
+		k_spin_unlock(&gps_lock, key);
+		return -ENODATA;
 	}
 
-	uart_irq_callback_user_data_set(gps_uart, gps_uart_cb, NULL);
-	uart_irq_rx_enable(gps_uart);
-
-	LOG_INF("[GPS] UART1 ready (9600 baud)");
+	*out = latest;
+	k_spin_unlock(&gps_lock, key);
 	return 0;
 }
 
-void gps_poll(void)
+uint32_t gps_get_update_count(void)
 {
-	/* GPS is IRQ-driven; nothing to poll */
+	k_spinlock_key_t key = k_spin_lock(&gps_lock);
+	uint32_t count = update_count;
+	k_spin_unlock(&gps_lock, key);
+	return count;
 }
 
-/* ═══════════════════════════════════════════════════════════════
- * NMEA Parser (verbatim from Arduino firmware)
- * ═══════════════════════════════════════════════════════════════ */
-
-static void parse_nmea_char(char c)
+int gps_format(const struct gps_data *data, char *buf, int buf_size)
 {
-	if (c == '$') {
-		nmea_idx = 0;
-	}
-	if (nmea_idx < 99) {
-		nmea_buf[nmea_idx++] = c;
-		nmea_buf[nmea_idx] = '\0';
-	}
-	if (c == '\n') {
-		parse_nmea_sentence();
-		nmea_idx = 0;
-	}
-}
-
-static bool validate_checksum(void)
-{
-	char *star = strchr(nmea_buf, '*');
-	if (!star || strlen(star) < 3) return false;
-
-	uint8_t expected = (uint8_t)strtol(star + 1, NULL, 16);
-	uint8_t calculated = 0;
-	for (char *p = nmea_buf + 1; p < star; p++) {
-		calculated ^= (uint8_t)*p;
-	}
-	return (calculated == expected);
-}
-
-static void parse_nmea_sentence(void)
-{
-	if (!validate_checksum()) return;
-
-	if (strncmp(nmea_buf, "$GPRMC", 6) == 0 ||
-	    strncmp(nmea_buf, "$GNRMC", 6) == 0) {
-		parse_rmc();
-	} else if (strncmp(nmea_buf, "$GPGGA", 6) == 0 ||
-		   strncmp(nmea_buf, "$GNGGA", 6) == 0) {
-		parse_gga();
-	}
-}
-
-static void parse_rmc(void)
-{
-	char *p = nmea_buf;
-	int field = 0;
-	char *tokens[15];
-
-	tokens[0] = p;
-	while (*p && field < 14) {
-		if (*p == ',') {
-			*p = '\0';
-			tokens[++field] = p + 1;
-		}
-		p++;
-	}
-	if (field < 8) return;
-
-	if (tokens[2][0] != 'A') {
-		g_gps.valid = false;
-		return;
+	if (!data->has_fix) {
+		return snprintf(buf, buf_size, "GPS: no fix (%u sats)",
+			data->satellites);
 	}
 
-	/* Latitude (DDMM.MMMM) */
-	if (strlen(tokens[3]) > 0) {
-		float raw = atof(tokens[3]);
-		int deg = (int)(raw / 100);
-		float min = raw - deg * 100;
-		g_gps.latitude = deg + min / 60.0f;
-		if (tokens[4][0] == 'S') g_gps.latitude = -g_gps.latitude;
-	}
+	/*
+	 * Convert nanodegrees to degrees with 6 decimal places.
+	 * We split into integer + fractional parts to avoid floating point.
+	 * Fractional part: (abs(nanodeg) % 1000000000) / 1000 → microdegrees
+	 */
+	int lat_deg = (int)(data->latitude_ndeg / 1000000000LL);
+	int lat_frac = (int)((data->latitude_ndeg < 0
+		? -data->latitude_ndeg : data->latitude_ndeg) % 1000000000LL / 1000);
+	int lon_deg = (int)(data->longitude_ndeg / 1000000000LL);
+	int lon_frac = (int)((data->longitude_ndeg < 0
+		? -data->longitude_ndeg : data->longitude_ndeg) % 1000000000LL / 1000);
 
-	/* Longitude (DDDMM.MMMM) */
-	if (strlen(tokens[5]) > 0) {
-		float raw = atof(tokens[5]);
-		int deg = (int)(raw / 100);
-		float min = raw - deg * 100;
-		g_gps.longitude = deg + min / 60.0f;
-		if (tokens[6][0] == 'W') g_gps.longitude = -g_gps.longitude;
-	}
-
-	/* Speed (knots → km/h) */
-	if (strlen(tokens[7]) > 0) {
-		g_gps.speed = atof(tokens[7]) * 1.852f;
-	}
-
-	/* Course */
-	if (strlen(tokens[8]) > 0) {
-		g_gps.course = atof(tokens[8]);
-	}
-
-	g_gps.valid = true;
-	g_gps.last_update = k_uptime_get();
-}
-
-static void parse_gga(void)
-{
-	char *p = nmea_buf;
-	int field = 0;
-	char *tokens[15];
-
-	tokens[0] = p;
-	while (*p && field < 14) {
-		if (*p == ',') {
-			*p = '\0';
-			tokens[++field] = p + 1;
-		}
-		p++;
-	}
-	if (field >= 7) {
-		g_gps.satellites = atoi(tokens[7]);
-	}
+	return snprintf(buf, buf_size,
+		"GPS: %d.%06d,%d.%06d alt=%dm spd=%u.%01um/s %usat %02u:%02u:%02u",
+		lat_deg, lat_frac,
+		lon_deg, lon_frac,
+		data->altitude_mm / 1000,
+		data->speed_mmps / 1000, (data->speed_mmps % 1000) / 100,
+		data->satellites,
+		data->hour, data->minute, data->second);
 }

@@ -8,6 +8,7 @@
 #include <zephyr/drivers/adc.h>
 #include <zephyr/logging/log.h>
 #include <nrfx_pdm.h>
+#include <hal/nrf_gpio.h>
 #include <math.h>
 
 #include "common.h"
@@ -15,6 +16,9 @@
 #include "ble.h"
 
 LOG_MODULE_REGISTER(sensors, LOG_LEVEL_INF);
+
+/* ─── PDM Instance ─── */
+static nrfx_pdm_t pdm_inst = NRFX_PDM_INSTANCE(0);
 
 /* ─── IMU ─── */
 static const struct device *imu_dev;
@@ -53,7 +57,7 @@ static void pdm_handler(nrfx_pdm_evt_t const *evt)
 	if (evt->buffer_requested) {
 		int16_t *next = (evt->buffer_released == pdm_buf_a)
 				? pdm_buf_b : pdm_buf_a;
-		nrfx_pdm_buffer_set(next);
+		nrfx_pdm_buffer_set(&pdm_inst, next, PDM_BUFFER_SIZE);
 	}
 }
 
@@ -87,35 +91,29 @@ int sensors_init(void)
 	LOG_INF("[IMU] LSM6DS3 ready (104 Hz, ±4g)");
 
 	/* ─── PDM Microphone ─── */
-	/* Enable mic power (P1.10 HIGH) — board DTS has regulator,
-	 * but ensure it's on */
+	/* XIAO Sense PDM pins: CLK = P1.00, DIN = P0.16 */
+	/* Enable microphone power (P1.10 = HIGH) */
+	NRF_P1->DIRSET = (1 << 10);
+	NRF_P1->OUTSET = (1 << 10);
+	k_msleep(5); /* Let mic power stabilize */
+
 	nrfx_pdm_config_t pdm_cfg = NRFX_PDM_DEFAULT_CONFIG(
-		/* CLK */ NRF_PDM_PSEL_DISCONNECTED,
-		/* DIN */ NRF_PDM_PSEL_DISCONNECTED);
+		NRF_GPIO_PIN_MAP(1, 0),   /* CLK = P1.00 */
+		NRF_GPIO_PIN_MAP(0, 16)); /* DIN = P0.16 */
 
-	/* Use the actual XIAO Sense PDM pins from the board DTS:
-	 * CLK = P0.01, DIN = P0.00 (check board schematic) */
-	pdm_cfg.pinout.clk = NRF_GPIO_PIN_MAP(0, 1);
-	pdm_cfg.pinout.din = NRF_GPIO_PIN_MAP(0, 0);
-	pdm_cfg.clock_freq = NRF_PDM_FREQ_1032K;
-	pdm_cfg.ratio = NRF_PDM_RATIO_64X;
-	pdm_cfg.gain_l = NRF_PDM_GAIN_DEFAULT;
-	pdm_cfg.gain_r = NRF_PDM_GAIN_DEFAULT;
-	pdm_cfg.mode = NRF_PDM_MODE_MONO;
-	pdm_cfg.edge = NRF_PDM_EDGE_LEFTFALLING;
-
-	err = nrfx_pdm_init(&pdm_cfg, pdm_handler);
+	err = nrfx_pdm_init(&pdm_inst, &pdm_cfg, pdm_handler);
 	if (err != NRFX_SUCCESS) {
 		LOG_ERR("[PDM] Init failed: %d", err);
 		return -EIO;
 	}
 
-	err = nrfx_pdm_start();
+	nrfx_pdm_buffer_set(&pdm_inst, pdm_buf_a, PDM_BUFFER_SIZE);
+
+	err = nrfx_pdm_start(&pdm_inst);
 	if (err != NRFX_SUCCESS) {
 		LOG_ERR("[PDM] Start failed: %d", err);
 		return -EIO;
 	}
-	nrfx_pdm_buffer_set(pdm_buf_a);
 
 	LOG_INF("[PDM] Microphone ready (16 kHz mono)");
 
@@ -137,6 +135,11 @@ int sensors_init(void)
 	NRF_SAADC->RESOLUTION = SAADC_RESOLUTION_VAL_12bit;
 	NRF_SAADC->OVERSAMPLE = SAADC_OVERSAMPLE_OVERSAMPLE_Bypass;
 	NRF_SAADC->ENABLE = 1;
+
+	/* Clear any stale SAADC events */
+	NRF_SAADC->EVENTS_STARTED = 0;
+	NRF_SAADC->EVENTS_END = 0;
+	NRF_SAADC->EVENTS_STOPPED = 0;
 
 	LOG_INF("[BAT] ADC ready");
 
@@ -180,8 +183,8 @@ void sensors_read_imu(void)
  * Gyro Calibration
  * ═══════════════════════════════════════════════════════════════ */
 
-#define GYRO_CAL_TIMEOUT_MS    10000
-#define GYRO_CAL_STILL_TIME_MS 1000
+#define GYRO_CAL_TIMEOUT_MS    3000
+#define GYRO_CAL_STILL_TIME_MS 500
 #define GYRO_CAL_SAMPLES       100
 #define GYRO_CAL_THRESHOLD_DPS 5.0f
 
@@ -320,20 +323,31 @@ void sensors_process_audio(void)
 float sensors_read_battery(void)
 {
 	static volatile int16_t result;
+	int timeout;
 
 	NRF_SAADC->RESULT.PTR = (uint32_t)&result;
 	NRF_SAADC->RESULT.MAXCNT = 1;
 
+	/* Clear any stale events */
+	NRF_SAADC->EVENTS_STARTED = 0;
+	NRF_SAADC->EVENTS_END = 0;
+	NRF_SAADC->EVENTS_STOPPED = 0;
+
 	NRF_SAADC->TASKS_START = 1;
-	while (!NRF_SAADC->EVENTS_STARTED);
+	timeout = 10000;
+	while (!NRF_SAADC->EVENTS_STARTED && --timeout > 0);
+	if (timeout == 0) { LOG_WRN("[BAT] SAADC start timeout"); return 0.0f; }
 	NRF_SAADC->EVENTS_STARTED = 0;
 
 	NRF_SAADC->TASKS_SAMPLE = 1;
-	while (!NRF_SAADC->EVENTS_END);
+	timeout = 10000;
+	while (!NRF_SAADC->EVENTS_END && --timeout > 0);
+	if (timeout == 0) { LOG_WRN("[BAT] SAADC sample timeout"); return 0.0f; }
 	NRF_SAADC->EVENTS_END = 0;
 
 	NRF_SAADC->TASKS_STOP = 1;
-	while (!NRF_SAADC->EVENTS_STOPPED);
+	timeout = 10000;
+	while (!NRF_SAADC->EVENTS_STOPPED && --timeout > 0);
 	NRF_SAADC->EVENTS_STOPPED = 0;
 
 	int adc_val = (result < 0) ? 0 : (int)result;
