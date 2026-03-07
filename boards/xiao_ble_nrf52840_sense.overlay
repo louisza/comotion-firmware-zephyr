@@ -1,4 +1,4 @@
-﻿/* CoMotion Tracker - Step 7: GPS + PDM Mic + SD Card + Battery ADC */
+﻿/* CoMotion Tracker — Full Integrated Firmware */
 
 /* Battery voltage divider: VBATT → 1MΩ → P0.31 (AIN7) → 510KΩ → P0.14 */
 / {

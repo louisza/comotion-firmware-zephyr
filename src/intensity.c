@@ -1,83 +1,123 @@
 /*
- * ═══════════════════════════════════════════════════════════════
- * CoMotion Tracker — Intensity Calculation
+ * CoMotion Tracker — Intensity & Movement Module
  *
- * Ported verbatim from Arduino firmware.
- * Pure C math — no library dependencies.
- * ═══════════════════════════════════════════════════════════════
+ * Algorithm (spec section 2):
+ *
+ *   accelMag = sqrt(ax² + ay² + az²)
+ *   gyroMag  = sqrt(gx² + gy² + gz²)
+ *   accelActivity = max(0, accelMag - 1.0)   // subtract 1g gravity
+ *   gyroActivity  = gyroMag / 100.0           // normalize 0-500 dps → 0-5
+ *   intensityRaw  = 0.7 × accelActivity + 0.3 × gyroActivity
+ *
+ * EMAs updated at 104 Hz:
+ *   1-second:  alpha = 0.019    = 2 / (1×104 + 1)
+ *   1-minute:  alpha = 0.00032  = 2 / (60×104 + 1)
+ *
+ * 10-minute rolling average: circular buffer of 1200 floats at 2 Hz.
+ *
+ * Movement counter: rising edge of intensityCurrent crossing 0.3.
  */
 
+#include <zephyr/kernel.h>
+#include <zephyr/logging/log.h>
 #include <math.h>
-#include "common.h"
+
 #include "intensity.h"
 
+LOG_MODULE_REGISTER(intensity, CONFIG_LOG_DEFAULT_LEVEL);
+
+/* ─── Constants (from spec section 13) ─── */
+#define ACCEL_WEIGHT        0.7f
+#define GYRO_WEIGHT         0.3f
+#define GYRO_SCALE          100.0f
+
+#define EMA_FAST_ALPHA      0.019f      /* 1-second at 104 Hz */
+#define EMA_SLOW_ALPHA      0.00032f    /* 1-minute at 104 Hz */
+
+#define HISTORY_SIZE        1200        /* 10 min at 2 Hz */
+#define MOVEMENT_THRESHOLD  0.3f
+
 /* ─── State ─── */
-static float intensity_raw;
-static float intensity_current;
-static float intensity_1min;
-static float intensity_history[INTENSITY_HISTORY_SIZE];
+static float intensity_current;                /* 1-second EMA */
+static float intensity_1min;                   /* 1-minute EMA */
+
+static float intensity_history[HISTORY_SIZE];  /* 10-min circular buffer */
+static float intensity_10min_sum;
 static uint16_t history_index;
-static uint16_t samples_in_history;
-static float    intensity_10min_sum;
+static uint16_t history_count;                 /* actual samples (ramps to 1200) */
 
-/* Movement detection */
-static bool was_above_threshold;
+static uint16_t move_count;
+static bool was_above;                         /* for rising-edge detector */
 
-/* ═══════════════════════════════════════════════════════════════
- * Called at 104 Hz from IMU timer
- * ═══════════════════════════════════════════════════════════════ */
+/* ─── Public API ─── */
 
-void intensity_update(void)
+void intensity_init(void)
 {
-	float ax = g_imu.ax, ay = g_imu.ay, az = g_imu.az;
-	float gx = g_imu.gx, gy = g_imu.gy, gz = g_imu.gz;
-
-	float accel_mag = sqrtf(ax*ax + ay*ay + az*az);
-	float gyro_mag  = sqrtf(gx*gx + gy*gy + gz*gz);
-
-	float accel_activity = (accel_mag > 1.0f) ? (accel_mag - 1.0f) : 0.0f;
-	float gyro_activity  = gyro_mag / INTENSITY_GYRO_SCALE;
-
-	intensity_raw = INTENSITY_ACCEL_WEIGHT * accel_activity
-		      + INTENSITY_GYRO_WEIGHT  * gyro_activity;
-
-	/* Exponential moving averages */
-	intensity_current = intensity_current * (1.0f - INTENSITY_EMA_FAST)
-			  + intensity_raw * INTENSITY_EMA_FAST;
-	intensity_1min    = intensity_1min * (1.0f - INTENSITY_EMA_SLOW)
-			  + intensity_raw * INTENSITY_EMA_SLOW;
-
-	/* Update max GPS speed */
-	if (g_gps.valid && g_gps.speed > g_max_speed_session) {
-		g_max_speed_session = g_gps.speed;
-	}
-
-	/* Movement counter: rising edge above threshold */
-	bool is_above = intensity_current > 0.3f;
-	if (is_above && !was_above_threshold) {
-		g_move_count++;
-	}
-	was_above_threshold = is_above;
+	intensity_reset();
+	LOG_INF("Intensity tracker ready (accel %.0f%% + gyro %.0f%%)",
+		(double)(ACCEL_WEIGHT * 100.0f),
+		(double)(GYRO_WEIGHT * 100.0f));
 }
 
-/* ═══════════════════════════════════════════════════════════════
- * Called at 2 Hz — rolling 10-minute history
- * ═══════════════════════════════════════════════════════════════ */
+void intensity_reset(void)
+{
+	intensity_current = 0.0f;
+	intensity_1min = 0.0f;
+	intensity_10min_sum = 0.0f;
+	history_index = 0;
+	history_count = 0;
+	move_count = 0;
+	was_above = false;
+	memset(intensity_history, 0, sizeof(intensity_history));
+	LOG_INF("Intensity session reset");
+}
+
+void intensity_feed(float ax_g, float ay_g, float az_g,
+		    float gx_dps, float gy_dps, float gz_dps)
+{
+	/* Acceleration magnitude (in g) */
+	float accel_mag = sqrtf(ax_g * ax_g + ay_g * ay_g + az_g * az_g);
+
+	/* Gyroscope magnitude (in dps) */
+	float gyro_mag = sqrtf(gx_dps * gx_dps + gy_dps * gy_dps + gz_dps * gz_dps);
+
+	/* Activity: subtract 1g from accel, normalize gyro */
+	float accel_activity = (accel_mag > 1.0f) ? (accel_mag - 1.0f) : 0.0f;
+	float gyro_activity = gyro_mag / GYRO_SCALE;
+
+	/* Weighted raw intensity */
+	float raw = ACCEL_WEIGHT * accel_activity + GYRO_WEIGHT * gyro_activity;
+
+	/* 1-second EMA */
+	intensity_current = intensity_current * (1.0f - EMA_FAST_ALPHA)
+			  + raw * EMA_FAST_ALPHA;
+
+	/* 1-minute EMA */
+	intensity_1min = intensity_1min * (1.0f - EMA_SLOW_ALPHA)
+		       + raw * EMA_SLOW_ALPHA;
+
+	/* Movement counter: rising edge above threshold */
+	bool is_above = (intensity_current > MOVEMENT_THRESHOLD);
+
+	if (is_above && !was_above) {
+		move_count++;
+	}
+	was_above = is_above;
+}
 
 void intensity_sample_history(void)
 {
+	/* Subtract old value, add new */
 	intensity_10min_sum -= intensity_history[history_index];
 	intensity_history[history_index] = intensity_current;
 	intensity_10min_sum += intensity_current;
 
-	if (samples_in_history < INTENSITY_HISTORY_SIZE) {
-		samples_in_history++;
+	if (history_count < HISTORY_SIZE) {
+		history_count++;
 	}
 
-	history_index = (history_index + 1) % INTENSITY_HISTORY_SIZE;
+	history_index = (history_index + 1) % HISTORY_SIZE;
 }
-
-/* ─── Getters ─── */
 
 float intensity_get_current(void)
 {
@@ -91,22 +131,13 @@ float intensity_get_1min(void)
 
 float intensity_get_10min_avg(void)
 {
-	uint16_t divisor = (samples_in_history > 0) ? samples_in_history : 1;
-	return intensity_10min_sum / divisor;
+	if (history_count == 0) {
+		return 0.0f;
+	}
+	return intensity_10min_sum / (float)history_count;
 }
 
-void intensity_reset(void)
+uint16_t intensity_get_move_count(void)
 {
-	g_max_speed_session = 0;
-	g_impact_count = 0;
-	g_move_count = 0;
-	intensity_current = 0;
-	intensity_1min = 0;
-	intensity_10min_sum = 0;
-	history_index = 0;
-	samples_in_history = 0;
-
-	for (int i = 0; i < INTENSITY_HISTORY_SIZE; i++) {
-		intensity_history[i] = 0;
-	}
+	return move_count;
 }

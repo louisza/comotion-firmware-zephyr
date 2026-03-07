@@ -99,11 +99,11 @@ int battery_millivolts(void)
 
 int battery_level_pct(void)
 {
-	/* Simple linear mapping for LiPo:
+	/* Linear mapping for LiPo (spec: 3.3V=0%, 4.2V=100%):
 	 *   4200 mV = 100%
-	 *   3000 mV = 0%   (safe cutoff)
+	 *   3300 mV = 0%
 	 */
-	int pct = (last_mv - 3000) * 100 / (4200 - 3000);
+	int pct = (last_mv - 3300) * 100 / (4200 - 3300);
 
 	if (pct < 0) {
 		pct = 0;

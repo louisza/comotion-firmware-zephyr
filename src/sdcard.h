@@ -1,8 +1,9 @@
 /*
- * CoMotion Tracker — SD Card Module
+ * CoMotion Tracker — SD Card Logging Module
  *
- * Mount/unmount FAT filesystem on external SD card (SPI).
- * Write sensor data as CSV log files.
+ * Ring-buffer based SD card logger for 104 Hz CSV data.
+ * Explicit start/stop logging via BLE commands.
+ * Session files: LOG001.CSV through LOG999.CSV.
  */
 
 #ifndef SDCARD_H
@@ -12,7 +13,7 @@
 #include <stdbool.h>
 
 /**
- * Initialize the SD card subsystem: check disk, mount FAT FS.
+ * Initialize SD card: check disk, mount FAT filesystem.
  *
  * @return 0 on success, negative errno on failure
  */
@@ -24,27 +25,74 @@ int sdcard_init(void);
 bool sdcard_is_mounted(void);
 
 /**
- * Write a line of text to the current log file.
- * Creates the file on first call.
+ * Start a new logging session.
+ * Opens next LOGnnn.CSV file, writes CSV header, begins accepting data.
  *
- * @param line  Null-terminated string to write (newline appended automatically)
  * @return 0 on success, negative errno on failure
  */
-int sdcard_write_line(const char *line);
+int sdcard_start_logging(void);
 
 /**
- * Flush buffered data to the SD card.
- * Call periodically to avoid data loss.
+ * Stop the current logging session.
+ * Flushes ring buffer, closes file.
  *
  * @return 0 on success, negative errno on failure
  */
-int sdcard_flush(void);
+int sdcard_stop_logging(void);
 
 /**
- * Close the log file and unmount the filesystem.
- *
- * @return 0 on success, negative errno on failure
+ * Check if logging is currently active.
  */
-int sdcard_close(void);
+bool sdcard_is_logging(void);
+
+/**
+ * Write a line to the ring buffer for later flush to SD.
+ * Non-blocking; drops data if ring buffer is full.
+ *
+ * @param data   Pointer to data bytes
+ * @param len    Number of bytes to write
+ * @return number of bytes written, or 0 if buffer full
+ */
+uint32_t sdcard_write(const char *data, uint32_t len);
+
+/**
+ * Check if ring buffer needs flushing (≥50% full or 5s elapsed).
+ * If so, flushes to SD card. Call from main loop or timer.
+ */
+void sdcard_check_flush(void);
+
+/**
+ * Force an immediate flush of the ring buffer to SD.
+ */
+void sdcard_flush(void);
+
+/**
+ * Mark an event tag to be included in the next logged CSV row.
+ * The tag is cleared after it appears in one row.
+ *
+ * @param tag  Event string (will be truncated to 31 chars)
+ */
+void sdcard_mark_event(const char *tag);
+
+/**
+ * Get the current event tag (empty string if none pending).
+ * Calling this consumes the event (returns it once).
+ *
+ * @param buf      Destination buffer
+ * @param buf_size Size of destination buffer
+ * @return true if an event was pending
+ */
+bool sdcard_consume_event(char *buf, uint32_t buf_size);
+
+/**
+ * Get current session filename (e.g., "LOG042.CSV").
+ * Returns empty string if not logging.
+ */
+const char *sdcard_get_filename(void);
+
+/**
+ * Get number of CSV data rows written in current session.
+ */
+uint32_t sdcard_get_sample_count(void);
 
 #endif /* SDCARD_H */

@@ -69,7 +69,7 @@ We are building this firmware one peripheral at a time:
 4. ✅ GPS (ATGM332D on UART0 via Zephyr GNSS framework)
 5. ✅ PDM microphone (Zephyr DMIC API, burst-mode 16kHz mono)
 6. ✅ SD card (SPI FAT FS — zephyr,sdhc-spi-slot + sdmmc-disk, CSV logging)
-7. ⬜ Battery ADC (direct SAADC)
+7. ✅ Battery ADC (voltage-divider sensor on AIN7, P0.14 enable)
 8. ⬜ Full integration
 
 Each step must compile, flash, and run correctly on real hardware before proceeding to the next.

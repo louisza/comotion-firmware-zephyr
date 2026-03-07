@@ -1,394 +1,808 @@
-﻿/*
- * CoMotion Tracker - Step 7: LED + IMU + BLE + GPS + PDM Mic + SD Card + Battery
+/*
+ * CoMotion Tracker — Full Integrated Firmware
  *
- * XIAO BLE Sense hardware:
- *   LEDs: Red (P0.26), Green (P0.30), Blue (P0.06) — active LOW
- *   IMU:  LSM6DS3TR-C on I2C0 @ 0x6A
- *   BLE:  Advertising as "CoMotion" with NUS
- *   GPS:  ATGM332D on UART0 (P1.11/P1.12) @ 9600 baud
- *   Mic:  MSM261D3526HICPM-C PDM (CLK=P1.00, DIN=P0.16)
- *   SD:   External SD card on SPI2, CS=P0.28 (XIAO D2)
- *   Batt: LiPo via voltage divider on AIN7 (P0.31), enable P0.14
+ * XIAO BLE Sense (nRF52840) wearable impact/motion tracker.
  *
- * Blue LED  = BLE connected
- * Green LED = IMU read in progress
- * Red LED   = error
+ * Architecture:
+ *   104 Hz timer:  IMU read → intensity → impact(IMU) → SD log (if logging)
+ *   10 Hz thread:  Audio PDM burst → RMS/peak/ZCR → baseline → impact(audio)
+ *   2 Hz (every 52 cycles): BLE advertising update, LED, intensity history
+ *   30s:           Battery ADC sample
+ *
+ * BLE:
+ *   Broadcast: 20-byte manufacturer data (no connection needed for monitoring)
+ *   NUS:       Text commands for start/stop logging, status, etc.
+ *
+ * LED:
+ *   Booting       → Blue solid
+ *   Idle          → Blue slow blink (500ms)
+ *   Logging+GPS   → Green solid
+ *   Logging noGPS → Green fast blink (250ms)
+ *   Low battery   → Red solid (overrides)
+ *   Event marked  → Blue 50ms flash
  */
 
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/sensor.h>
-#include <zephyr/bluetooth/bluetooth.h>
-#include <zephyr/bluetooth/gap.h>
-#include <zephyr/bluetooth/conn.h>
-#include <bluetooth/services/nus.h>
+#include <zephyr/logging/log.h>
 #include <stdio.h>
+#include <string.h>
+#include <math.h>
+#include <limits.h>
 
-#include "gps.h"
-#include "pdm_mic.h"
+#include "intensity.h"
+#include "impact.h"
+#include "audio.h"
 #include "sdcard.h"
+#include "ble_adv.h"
+#include "gps.h"
 #include "battery.h"
 
-/* ─── LEDs ─── */
+LOG_MODULE_REGISTER(main, CONFIG_LOG_DEFAULT_LEVEL);
+
+/* ─── Timing constants (spec section 12–13) ─── */
+#define IMU_PERIOD_US       9615    /* 1/104 Hz ≈ 9.615 ms */
+#define FAST_CYCLES         21      /* 104/5 ≈ 21 → ~5 Hz (BLE updates) */
+#define SLOW_CYCLES         52      /* 104/2 = 52 → 2 Hz */
+#define BATT_CYCLES         3120    /* 104 × 30 = 3120 → every 30s */
+#define GPS_STALE_MS        2000    /* GPS fix older than this → stale (generous for jitter) */
+#define GYRO_CAL_TIMEOUT_MS 10000
+#define GYRO_CAL_STILL_MS   1000
+#define GYRO_CAL_SAMPLES    100
+#define GYRO_CAL_THRESH_DPS 5.0f
+#define EVENT_FLASH_MS      50      /* Blue LED flash for event */
+
+/* ─── LEDs (active LOW, handled by DTS flags) ─── */
 static const struct gpio_dt_spec led_red   = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
 static const struct gpio_dt_spec led_green = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
 static const struct gpio_dt_spec led_blue  = GPIO_DT_SPEC_GET(DT_ALIAS(led2), gpios);
 
 /* ─── IMU ─── */
 static const struct device *imu;
+static bool imu_ok;
 
-/* ─── BLE state ─── */
-static struct bt_conn *current_conn;
-static bool nus_notifications_enabled;
+/* Gyro calibration offsets (spec section 9) */
+static float gyro_off_x, gyro_off_y, gyro_off_z;
 
-/* ─── BLE Advertising Data ─── */
-static const struct bt_data ad[] = {
-	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
-	BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME, sizeof(CONFIG_BT_DEVICE_NAME) - 1),
-};
+/* ─── 104 Hz timer + semaphore ─── */
+K_SEM_DEFINE(imu_tick, 0, 1);
 
-static const struct bt_data sd[] = {
-	BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_NUS_VAL),
-};
-
-/* ─── BLE Connection Callbacks ─── */
-static void connected(struct bt_conn *conn, uint8_t err)
+static void imu_timer_handler(struct k_timer *t)
 {
-	if (err) {
-		printk("BLE: connection failed (err %u)\n", err);
-		return;
-	}
-	current_conn = bt_conn_ref(conn);
-	gpio_pin_set_dt(&led_blue, 1);
-	printk("BLE: connected\n");
+	ARG_UNUSED(t);
+	k_sem_give(&imu_tick);
 }
 
-static void disconnected(struct bt_conn *conn, uint8_t reason)
-{
-	printk("BLE: disconnected (reason %u)\n", reason);
-	gpio_pin_set_dt(&led_blue, 0);
-	if (current_conn) {
-		bt_conn_unref(current_conn);
-		current_conn = NULL;
-	}
-	nus_notifications_enabled = false;
+K_TIMER_DEFINE(imu_timer, imu_timer_handler, NULL);
 
-	/* Restart advertising */
-	bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+/* ─── Session state ─── */
+static int64_t log_start_time;
+static float max_speed_kmh;
+
+/* ─── LED state ─── */
+static int64_t event_flash_off;
+
+/* ─── Deferred NUS command processing ─── */
+static char pending_cmd[64];
+static K_SEM_DEFINE(cmd_sem, 0, 1);
+
+/* ─── Sensor value → float converters ─── */
+
+/**
+ * Zephyr accel sensor_value (m/s²) → g.
+ * 1g = 9.80665 m/s².
+ */
+static inline float sv_to_g(const struct sensor_value *sv)
+{
+	float ms2 = (float)sv->val1 + (float)sv->val2 / 1000000.0f;
+	return ms2 / 9.80665f;
 }
 
-BT_CONN_CB_DEFINE(conn_cbs) = {
-	.connected    = connected,
-	.disconnected = disconnected,
-};
-
-/* ─── NUS Callbacks ─── */
-static void nus_received(struct bt_conn *conn, const uint8_t *const data, uint16_t len)
+/**
+ * Zephyr gyro sensor_value (rad/s) → degrees/s.
+ * 1 rad/s = 57.2958 deg/s.
+ */
+static inline float sv_to_dps(const struct sensor_value *sv)
 {
-	char buf[64];
-	uint16_t copy_len = (len < sizeof(buf) - 1) ? len : sizeof(buf) - 1;
-
-	memcpy(buf, data, copy_len);
-	buf[copy_len] = '\0';
-
-	printk("BLE RX: %s\n", buf);
-
-	/* Echo back for testing */
-	char reply[80];
-	int n = snprintf(reply, sizeof(reply), "echo: %s\n", buf);
-	bt_nus_send(conn, (uint8_t *)reply, n);
+	float rads = (float)sv->val1 + (float)sv->val2 / 1000000.0f;
+	return rads * 57.2958f;
 }
 
-static void nus_send_enabled(enum bt_nus_send_status status)
-{
-	nus_notifications_enabled = (status == BT_NUS_SEND_STATUS_ENABLED);
-	printk("BLE: NUS notifications %s\n",
-		nus_notifications_enabled ? "enabled" : "disabled");
-}
+/* ─── IMU Init ─── */
 
-static struct bt_nus_cb nus_cbs = {
-	.received     = nus_received,
-	.send_enabled = nus_send_enabled,
-};
-
-/* ─── IMU ─── */
 static int init_imu(void)
 {
 	imu = DEVICE_DT_GET_ONE(st_lsm6dsl);
 	if (!device_is_ready(imu)) {
-		printk("IMU: device not ready!\n");
+		LOG_ERR("IMU: device not ready");
 		return -ENODEV;
 	}
 
 	struct sensor_value val;
 
-	val.val1 = 16;
-	val.val2 = 0;
+	val.val1 = 16; val.val2 = 0;
 	sensor_attr_set(imu, SENSOR_CHAN_ACCEL_XYZ,
-		SENSOR_ATTR_FULL_SCALE, &val);
+			SENSOR_ATTR_FULL_SCALE, &val);
 
-	val.val1 = 1000;
-	val.val2 = 0;
+	val.val1 = 1000; val.val2 = 0;
 	sensor_attr_set(imu, SENSOR_CHAN_GYRO_XYZ,
-		SENSOR_ATTR_FULL_SCALE, &val);
+			SENSOR_ATTR_FULL_SCALE, &val);
 
-	val.val1 = 104;
-	val.val2 = 0;
+	val.val1 = 104; val.val2 = 0;
 	sensor_attr_set(imu, SENSOR_CHAN_ACCEL_XYZ,
-		SENSOR_ATTR_SAMPLING_FREQUENCY, &val);
+			SENSOR_ATTR_SAMPLING_FREQUENCY, &val);
 	sensor_attr_set(imu, SENSOR_CHAN_GYRO_XYZ,
-		SENSOR_ATTR_SAMPLING_FREQUENCY, &val);
+			SENSOR_ATTR_SAMPLING_FREQUENCY, &val);
 
-	printk("IMU: LSM6DS3TR-C ready (16g, 1000dps, 104Hz)\n");
+	LOG_INF("IMU: LSM6DS3TR-C ready (16g, 1000dps, 104Hz)");
 	return 0;
 }
 
-static void read_and_send_imu(int cycle)
-{
-	struct sensor_value accel[3], gyro[3];
+/* ─── Gyro Calibration (spec section 9) ─── */
 
-	if (sensor_sample_fetch(imu)) {
-		printk("[%d] IMU: fetch failed\n", cycle);
-		return;
+static void gyro_calibrate(void)
+{
+	struct sensor_value gyro[3];
+	int64_t start = k_uptime_get();
+	int64_t still_start = 0;
+	bool was_still = false;
+
+	LOG_INF("Gyro cal: waiting for stillness...");
+
+	/* Phase 1: Wait for stillness */
+	while ((k_uptime_get() - start) < GYRO_CAL_TIMEOUT_MS) {
+		if (sensor_sample_fetch(imu) != 0) {
+			k_msleep(10);
+			continue;
+		}
+		sensor_channel_get(imu, SENSOR_CHAN_GYRO_X, &gyro[0]);
+		sensor_channel_get(imu, SENSOR_CHAN_GYRO_Y, &gyro[1]);
+		sensor_channel_get(imu, SENSOR_CHAN_GYRO_Z, &gyro[2]);
+
+		float gx = sv_to_dps(&gyro[0]);
+		float gy = sv_to_dps(&gyro[1]);
+		float gz = sv_to_dps(&gyro[2]);
+		float mag = sqrtf(gx * gx + gy * gy + gz * gz);
+
+		if (mag < GYRO_CAL_THRESH_DPS) {
+			if (!was_still) {
+				still_start = k_uptime_get();
+				was_still = true;
+			} else if ((k_uptime_get() - still_start) >=
+				   GYRO_CAL_STILL_MS) {
+				goto phase2;
+			}
+		} else {
+			was_still = false;
+		}
+		k_msleep(10);
 	}
 
-	sensor_channel_get(imu, SENSOR_CHAN_ACCEL_X, &accel[0]);
-	sensor_channel_get(imu, SENSOR_CHAN_ACCEL_Y, &accel[1]);
-	sensor_channel_get(imu, SENSOR_CHAN_ACCEL_Z, &accel[2]);
-	sensor_channel_get(imu, SENSOR_CHAN_GYRO_X, &gyro[0]);
-	sensor_channel_get(imu, SENSOR_CHAN_GYRO_Y, &gyro[1]);
-	sensor_channel_get(imu, SENSOR_CHAN_GYRO_Z, &gyro[2]);
+	LOG_WRN("Gyro cal: timeout — using zero offsets");
+	return;
 
-	/* Print to USB serial */
-	printk("[%d] A: %d.%02d %d.%02d %d.%02d  G: %d.%02d %d.%02d %d.%02d\n",
-		cycle,
-		accel[0].val1, abs(accel[0].val2) / 10000,
-		accel[1].val1, abs(accel[1].val2) / 10000,
-		accel[2].val1, abs(accel[2].val2) / 10000,
-		gyro[0].val1, abs(gyro[0].val2) / 10000,
-		gyro[1].val1, abs(gyro[1].val2) / 10000,
-		gyro[2].val1, abs(gyro[2].val2) / 10000);
+phase2:
+	LOG_INF("Gyro cal: collecting %d samples...", GYRO_CAL_SAMPLES);
 
-	/* Also send over BLE if connected + notifications on */
-	if (nus_notifications_enabled) {
-		char msg[120];
-		int n = snprintf(msg, sizeof(msg),
-			"A:%d.%02d,%d.%02d,%d.%02d G:%d.%02d,%d.%02d,%d.%02d\n",
-			accel[0].val1, abs(accel[0].val2) / 10000,
-			accel[1].val1, abs(accel[1].val2) / 10000,
-			accel[2].val1, abs(accel[2].val2) / 10000,
-			gyro[0].val1, abs(gyro[0].val2) / 10000,
-			gyro[1].val1, abs(gyro[1].val2) / 10000,
-			gyro[2].val1, abs(gyro[2].val2) / 10000);
-		bt_nus_send(NULL, (uint8_t *)msg, n);
+	float sum_x = 0, sum_y = 0, sum_z = 0;
+	int count = 0;
+
+	for (int i = 0; i < GYRO_CAL_SAMPLES; i++) {
+		if (sensor_sample_fetch(imu) == 0) {
+			sensor_channel_get(imu, SENSOR_CHAN_GYRO_X, &gyro[0]);
+			sensor_channel_get(imu, SENSOR_CHAN_GYRO_Y, &gyro[1]);
+			sensor_channel_get(imu, SENSOR_CHAN_GYRO_Z, &gyro[2]);
+			sum_x += sv_to_dps(&gyro[0]);
+			sum_y += sv_to_dps(&gyro[1]);
+			sum_z += sv_to_dps(&gyro[2]);
+			count++;
+		}
+		k_msleep(5);
+	}
+
+	if (count > 0) {
+		gyro_off_x = sum_x / (float)count;
+		gyro_off_y = sum_y / (float)count;
+		gyro_off_z = sum_z / (float)count;
+		LOG_INF("Gyro cal: offset (%.2f, %.2f, %.2f) dps from %d samples",
+			(double)gyro_off_x, (double)gyro_off_y,
+			(double)gyro_off_z, count);
 	}
 }
 
-/* ─── Main ─── */
+/* ─── NUS Receive Callback (runs on BT thread — must be lightweight!) ─── */
+
+static void nus_rx_handler(struct bt_conn *conn, const uint8_t *data,
+			   uint16_t len)
+{
+	ARG_UNUSED(conn);
+
+	/* Just stash the command and signal the main loop to process it.
+	 * The BT RX thread has a tiny stack — SD card, snprintf, etc.
+	 * would overflow it instantly.
+	 */
+	uint16_t copy = MIN(len, sizeof(pending_cmd) - 1);
+
+	memcpy(pending_cmd, data, copy);
+	pending_cmd[copy] = '\0';
+
+	/* Strip trailing whitespace/newline */
+	while (copy > 0 && (pending_cmd[copy - 1] == '\n' ||
+			    pending_cmd[copy - 1] == '\r' ||
+			    pending_cmd[copy - 1] == ' ')) {
+		pending_cmd[--copy] = '\0';
+	}
+
+	k_sem_give(&cmd_sem);
+}
+
+/* ─── Command Processor (runs on main thread with 8KB stack) ─── */
+
+static void process_command(const char *cmd)
+{
+	LOG_INF("NUS CMD: \"%s\"", cmd);
+
+	if (strcmp(cmd, "ping") == 0) {
+		ble_adv_nus_send("pong\n");
+	} else if (strcmp(cmd, "info") == 0) {
+		ble_adv_nus_send("CoMotion v2.0.0\n");
+	} else if (strcmp(cmd, "bat") == 0) {
+		char buf[32];
+
+		snprintf(buf, sizeof(buf), "BAT:%d.%02dV\n",
+			 battery_millivolts() / 1000,
+			 (battery_millivolts() % 1000) / 10);
+		ble_adv_nus_send(buf);
+	} else if (strcmp(cmd, "start") == 0) {
+		if (sdcard_is_logging()) {
+			ble_adv_nus_send("ERR:Already logging\n");
+			return;
+		}
+		/* Reset session stats */
+		intensity_reset();
+		impact_reset();
+		max_speed_kmh = 0;
+		log_start_time = k_uptime_get();
+
+		int ret = sdcard_start_logging();
+
+		if (ret == 0) {
+			ble_adv_nus_send("OK:Logging started\n");
+		} else {
+			ble_adv_nus_send("ERR:Failed to start logging\n");
+		}
+	} else if (strcmp(cmd, "stop") == 0) {
+		sdcard_stop_logging();
+		ble_adv_nus_send("OK:Logging stopped\n");
+	} else if (strcmp(cmd, "status") == 0) {
+		char buf[200];
+		int pos = 0;
+
+		pos += snprintf(buf + pos, sizeof(buf) - pos, "STATUS:%s\n",
+				sdcard_is_logging() ? "LOGGING" : "IDLE");
+
+		struct gps_data sg = {0};
+
+		gps_get_data(&sg);
+		pos += snprintf(buf + pos, sizeof(buf) - pos,
+				"GPS:%s SATS:%u\n",
+				(sg.has_fix && sg.satellites >= 4)
+					? "OK" : "NO_FIX",
+				sg.satellites);
+
+		pos += snprintf(buf + pos, sizeof(buf) - pos,
+				"BAT:%d.%02dV\n",
+				battery_millivolts() / 1000,
+				(battery_millivolts() % 1000) / 10);
+
+		if (sdcard_is_logging()) {
+			int64_t elapsed = (k_uptime_get() - log_start_time) / 1000;
+
+			pos += snprintf(buf + pos, sizeof(buf) - pos,
+					"FILE:%s\n",
+					sdcard_get_filename());
+			pos += snprintf(buf + pos, sizeof(buf) - pos,
+					"SAMPLES:%u\n",
+					sdcard_get_sample_count());
+			pos += snprintf(buf + pos, sizeof(buf) - pos,
+					"ELAPSED:%lld\n", elapsed);
+		}
+		ble_adv_nus_send(buf);
+	} else if (strncmp(cmd, "event:", 6) == 0) {
+		sdcard_mark_event(cmd + 6);
+		ble_adv_nus_send("OK:Event marked\n");
+		/* Blue LED flash */
+		gpio_pin_set_dt(&led_blue, 1);
+		event_flash_off = k_uptime_get() + EVENT_FLASH_MS;
+	} else if (strcmp(cmd, "focus") == 0) {
+		ble_adv_set_focus(true);
+		ble_adv_nus_send("OK:Focus mode ON (60s)\n");
+	} else if (strcmp(cmd, "normal") == 0) {
+		ble_adv_set_focus(false);
+		ble_adv_nus_send("OK:Normal mode\n");
+	} else if (strcmp(cmd, "gps") == 0) {
+		struct gps_data g = {0};
+
+		gps_get_data(&g);
+		char buf[256];
+		int pos = 0;
+
+		pos += gps_format(&g, buf + pos, sizeof(buf) - pos);
+		pos += snprintf(buf + pos, sizeof(buf) - pos, "\n");
+		pos += snprintf(buf + pos, sizeof(buf) - pos,
+				"HDOP:%u.%u UPD:%u\n",
+				g.hdop / 1000, (g.hdop % 1000) / 100,
+				g.update_count);
+		ble_adv_nus_send(buf);
+	} else {
+		ble_adv_nus_send("ERR:Unknown command\n");
+	}
+}
+
+/* ─── LED Update (spec section 11, called at 2 Hz) ─── */
+
+static void update_leds(uint32_t cycle)
+{
+	int64_t now = k_uptime_get();
+
+	/* Event flash auto-off */
+	if (event_flash_off && now >= event_flash_off) {
+		gpio_pin_set_dt(&led_blue, 0);
+		event_flash_off = 0;
+	}
+
+	/* Low battery overrides everything */
+	if (battery_millivolts() > 0 && battery_millivolts() < 3300) {
+		gpio_pin_set_dt(&led_red, 1);
+		gpio_pin_set_dt(&led_green, 0);
+		gpio_pin_set_dt(&led_blue, 0);
+		return;
+	}
+	gpio_pin_set_dt(&led_red, 0);
+
+	if (sdcard_is_logging()) {
+		gpio_pin_set_dt(&led_blue, 0);
+
+		/* Logging: green behavior depends on GPS */
+		struct gps_data lg = {0};
+		bool gps_fix = (gps_get_data(&lg) == 0
+				&& lg.has_fix && lg.satellites >= 4
+				&& lg.last_fix_ms > 0
+				&& (now - lg.last_fix_ms) < GPS_STALE_MS);
+
+		if (gps_fix) {
+			/* Green solid */
+			gpio_pin_set_dt(&led_green, 1);
+		} else {
+			/* Green fast blink (250ms at 2Hz → toggle every call) */
+			gpio_pin_set_dt(&led_green, (cycle / SLOW_CYCLES) & 1);
+		}
+	} else {
+		gpio_pin_set_dt(&led_green, 0);
+
+		/* Idle: blue slow blink (500ms at 2Hz → toggle every call) */
+		if (!event_flash_off) {
+			gpio_pin_set_dt(&led_blue, (cycle / SLOW_CYCLES) & 1);
+		}
+	}
+}
+
+/* ─── Build BLE Advertising Packet (spec section 1) ─── */
+
+static void build_ble_packet(struct ble_packet *pkt)
+{
+	memset(pkt, 0, sizeof(*pkt));
+
+	/*
+	 * Single atomic GPS snapshot — all fields + timing are consistent.
+	 * Pre-zero so fields are safe even if gps_get_data() returns -ENODATA.
+	 */
+	struct gps_data gps = {0};
+	bool gps_ok = (gps_get_data(&gps) == 0);
+	int64_t now = k_uptime_get();
+
+	/* Fix age based on last VALID fix, not last callback */
+	int64_t fix_age_ms = (gps_ok && gps.last_fix_ms > 0)
+			   ? (now - gps.last_fix_ms) : INT64_MAX;
+	bool have_gps = gps_ok && gps.has_fix
+		     && fix_age_ms < GPS_STALE_MS
+		     && gps.satellites >= 4;
+
+	/* Status flags */
+	uint8_t flags = 0;
+
+	if (sdcard_is_logging()) {
+		flags |= STATUS_LOGGING;
+	}
+
+	if (have_gps) {
+		flags |= STATUS_GPS_FIX;
+	}
+
+	if (battery_millivolts() > 0 && battery_millivolts() < 3300) {
+		flags |= STATUS_BATT_LOW;
+	}
+
+	if (impact_is_recent()) {
+		flags |= STATUS_IMPACT;
+	}
+
+	if (ble_adv_is_connected()) {
+		flags |= STATUS_CONNECTED;
+	}
+
+	if (ble_adv_is_focus()) {
+		flags |= STATUS_FOCUS;
+	}
+
+	pkt->status_flags = flags;
+
+	/* Battery */
+	pkt->battery_pct = (uint8_t)battery_level_pct();
+
+	/* Intensity: encode per spec */
+	float ic = intensity_get_current();
+	float i1 = intensity_get_1min();
+	float i10 = intensity_get_10min_avg();
+
+	pkt->intensity_1s = (uint8_t)MIN(ic * 100.0f, 255.0f);
+	pkt->intensity_1min = (uint8_t)MIN(i1 * 100.0f, 255.0f);
+
+	uint32_t i10_enc = (uint32_t)MIN(i10 * 1000.0f, 65535.0f);
+
+	pkt->intensity_10min = (uint16_t)i10_enc;
+
+	/*
+	 * GPS speed — capped at 200 km/h to prevent garbage from corrupting max.
+	 * Additional guards: require fix_quality > 0 (valid fix) and HDOP < 5000
+	 * (< 5.0) to reject wild speed values from early converging fixes.
+	 */
+	if (have_gps && gps.fix_quality > 0 && gps.hdop > 0 && gps.hdop < 5000) {
+		uint32_t speed_capped = MIN(gps.speed_mmps, 55556u);
+		float speed_kmh = (float)speed_capped * 0.0036f;
+
+		pkt->speed_now = (uint8_t)MIN(speed_kmh * 2.0f, 255.0f);
+
+		if (speed_kmh > max_speed_kmh) {
+			max_speed_kmh = speed_kmh;
+		}
+	} else if (have_gps) {
+		/* Have fix but low quality — show speed_now but don't update max */
+		uint32_t speed_capped = MIN(gps.speed_mmps, 55556u);
+		float speed_kmh = (float)speed_capped * 0.0036f;
+
+		pkt->speed_now = (uint8_t)MIN(speed_kmh * 2.0f, 255.0f);
+	}
+	pkt->speed_max = (uint8_t)MIN(max_speed_kmh * 2.0f, 255.0f);
+
+	/* Impact count */
+	pkt->impact_count = impact_get_count();
+
+	/* GPS status: (fix_age_seconds << 4) | sat_count
+	 * Uses fix age (not update age) so the app sees how old the POSITION is.
+	 * If we've never had a fix, age = 15 (max).
+	 */
+	if (gps_ok) {
+		uint8_t age_s;
+
+		if (gps.last_fix_ms > 0 && fix_age_ms < INT64_MAX) {
+			age_s = (uint8_t)MIN(fix_age_ms / 1000, 15);
+		} else {
+			age_s = 15; /* never had a fix */
+		}
+
+		uint8_t sats = (uint8_t)MIN(gps.satellites, 15);
+
+		pkt->gps_status = (age_s << 4) | sats;
+	}
+
+	/* Move count */
+	pkt->move_count = intensity_get_move_count();
+
+	/* Session seconds: always report time since boot so the app
+	 * knows the tracker is alive even when not logging to SD.
+	 * When logging, this also serves as the logging duration
+	 * (log_start_time is set at boot-level init).
+	 */
+	{
+		int64_t elapsed = now / 1000;
+
+		pkt->session_seconds = (uint16_t)MIN(elapsed, 65535);
+	}
+
+	/* Audio peak */
+	struct audio_data aud;
+
+	audio_get_data(&aud);
+	pkt->audio_peak = (uint8_t)MIN(aud.peak / 128, 255);
+
+	/* GPS position — absolute int32 in deci-microdegrees (×10⁷).
+	 * App decodes: degrees = latitude / 10000000.0
+	 * Range: ±214.7° (full globe), precision: ~1.1 cm.
+	 * Simple integer divide from nanodegrees: ndeg / 100.
+	 */
+	if (have_gps) {
+		pkt->latitude  = (int32_t)(gps.latitude_ndeg / 100LL);
+		pkt->longitude = (int32_t)(gps.longitude_ndeg / 100LL);
+	} else {
+		pkt->latitude  = GPS_NO_FIX;
+		pkt->longitude = GPS_NO_FIX;
+	}
+
+	/* Bearing: millidegrees → ×10 (0–3600 for 0.0–360.0°) */
+	if (have_gps) {
+		pkt->bearing = (uint16_t)MIN(gps.bearing_mdeg / 100u, 3600u);
+	}
+
+	/* HDOP: milli-DOP → ×10 (e.g. 1200 → 12 = 1.2 HDOP) */
+	if (gps_ok) {
+		pkt->hdop = (uint8_t)MIN(gps.hdop / 100u, 255u);
+	}
+
+	/* Fix quality: 0=invalid, 1=SPS, 2=DGNSS, etc. */
+	if (gps_ok) {
+		pkt->fix_quality = gps.fix_quality;
+	}
+}
+
+/* ─── CSV Line Formatter (spec section 8, called at 104 Hz if logging) ─── */
+
+static void format_and_log_csv(float ax, float ay, float az,
+			       float gx, float gy, float gz)
+{
+	char line[256];
+	int pos = 0;
+
+	/* timestamp (ms since boot) */
+	pos += snprintf(line + pos, sizeof(line) - pos, "%u,",
+			(uint32_t)k_uptime_get());
+
+	/* IMU: accel (g, 4dp), gyro (dps, 2dp) */
+	pos += snprintf(line + pos, sizeof(line) - pos,
+			"%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,",
+			(double)ax, (double)ay, (double)az,
+			(double)gx, (double)gy, (double)gz);
+
+	/* GPS: lat,lng,speed,course,sats — single atomic read */
+	struct gps_data csv_gps = {0};
+	bool csv_gps_ok = (gps_get_data(&csv_gps) == 0);
+	int64_t csv_fix_age = (csv_gps_ok && csv_gps.last_fix_ms > 0)
+			   ? (k_uptime_get() - csv_gps.last_fix_ms)
+			   : INT64_MAX;
+	bool csv_have_gps = csv_gps_ok && csv_gps.has_fix
+			 && csv_fix_age < GPS_STALE_MS
+			 && csv_gps.satellites >= 4;
+
+	if (csv_have_gps) {
+		double lat = (double)csv_gps.latitude_ndeg / 1e9;
+		double lng = (double)csv_gps.longitude_ndeg / 1e9;
+		float speed = (float)csv_gps.speed_mmps * 0.0036f;
+		float course = (float)csv_gps.bearing_mdeg / 1000.0f;
+
+		pos += snprintf(line + pos, sizeof(line) - pos,
+				"%.6f,%.6f,%.1f,%.1f,%u,",
+				lat, lng, (double)speed, (double)course,
+				csv_gps.satellites);
+	} else {
+		pos += snprintf(line + pos, sizeof(line) - pos, ",,,,,");
+	}
+
+	/* Audio: rms, peak, zcr */
+	struct audio_data aud;
+
+	audio_get_data(&aud);
+	pos += snprintf(line + pos, sizeof(line) - pos, "%.0f,%u,%u,",
+			(double)aud.rms, aud.peak, aud.zcr);
+
+	/* Event tag (consumed on first use) */
+	char evt[32];
+
+	if (sdcard_consume_event(evt, sizeof(evt))) {
+		/* Quote if it contains a comma */
+		if (strchr(evt, ',')) {
+			pos += snprintf(line + pos, sizeof(line) - pos,
+					"\"%s\"", evt);
+		} else {
+			pos += snprintf(line + pos, sizeof(line) - pos,
+					"%s", evt);
+		}
+	}
+
+	/* Newline */
+	if (pos < (int)sizeof(line) - 1) {
+		line[pos++] = '\n';
+	}
+
+	sdcard_write(line, pos);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * Main
+ * ═══════════════════════════════════════════════════════════════ */
 int main(void)
 {
-	int err;
-	int cycle = 0;
+	int ret;
+	uint32_t cycle = 0;
+
+	/* Blue LED solid during boot */
+	gpio_pin_configure_dt(&led_red, GPIO_OUTPUT_INACTIVE);
+	gpio_pin_configure_dt(&led_green, GPIO_OUTPUT_INACTIVE);
+	gpio_pin_configure_dt(&led_blue, GPIO_OUTPUT_ACTIVE);
 
 	/* Give USB 2 seconds to enumerate */
 	k_msleep(2000);
 
-	printk("\n\n=== CoMotion Step 7: LED + IMU + BLE + GPS + Mic + SD + Batt ===\n");
-
-	/* --- LEDs --- */
-	err  = gpio_pin_configure_dt(&led_red,   GPIO_OUTPUT_INACTIVE);
-	err |= gpio_pin_configure_dt(&led_green, GPIO_OUTPUT_INACTIVE);
-	err |= gpio_pin_configure_dt(&led_blue,  GPIO_OUTPUT_INACTIVE);
-	if (err) {
-		printk("LED config failed: %d\n", err);
-		return err;
-	}
-	printk("LEDs: OK\n");
+	printk("\n\n");
+	printk("================================================\n");
+	printk("  CoMotion Tracker v2.0.0\n");
+	printk("  XIAO BLE Sense (nRF52840)\n");
+	printk("================================================\n\n");
 
 	/* --- IMU --- */
-	err = init_imu();
-	if (err) {
-		printk("IMU init failed — continuing without IMU\n");
+	ret = init_imu();
+	if (ret) {
+		printk("[!!] IMU init failed\n");
+	} else {
+		imu_ok = true;
+		printk("[OK] IMU (LSM6DS3TR-C)\n");
+
+		/* Gyro calibration */
+		gyro_calibrate();
 	}
+
+	/* --- Intensity + Impact --- */
+	intensity_init();
+	impact_init();
+	printk("[OK] Intensity + impact detection\n");
 
 	/* --- GPS --- */
-	/* GNSS framework auto-initializes from device tree.
-	 * Data arrives via GNSS_DATA_CALLBACK_DEFINE in gps.c */
 	{
 		const struct device *gnss = DEVICE_DT_GET(DT_NODELABEL(gnss));
+
 		if (device_is_ready(gnss)) {
-			printk("GPS: GNSS device ready on UART0 (9600 baud)\n");
+			printk("[OK] GPS on UART0\n");
+			ret = gps_init();
+			if (ret) {
+				printk("[!!] GPS config failed (%d)\n", ret);
+			} else {
+				printk("[OK] GPS configured\n");
+			}
 		} else {
-			printk("GPS: ERROR - GNSS device NOT ready!\n");
-			gpio_pin_set_dt(&led_red, 1);
+			printk("[!!] GPS not ready\n");
 		}
 	}
 
-	/* --- BLE --- */
-	err = bt_enable(NULL);
-	if (err) {
-		printk("BLE: bt_enable failed (err %d)\n", err);
-		gpio_pin_set_dt(&led_red, 1);
-		return err;
-	}
-	printk("BLE: stack enabled\n");
-
-	err = bt_nus_init(&nus_cbs);
-	if (err) {
-		printk("BLE: NUS init failed (err %d)\n", err);
-	}
-
-	err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
-	if (err) {
-		printk("BLE: advertising failed (err %d)\n", err);
+	/* --- Audio (starts its own thread) --- */
+	ret = audio_init();
+	if (ret) {
+		printk("[!!] Audio init failed (%d)\n", ret);
 	} else {
-		printk("BLE: advertising as \"%s\"\n", CONFIG_BT_DEVICE_NAME);
-	}
-
-	/* --- PDM Microphone --- */
-	err = pdm_mic_init();
-	if (err) {
-		printk("MIC: init failed (err %d) — continuing without mic\n", err);
-	} else {
-		err = pdm_mic_start();
-		if (err) {
-			printk("MIC: start failed (err %d)\n", err);
-		}
+		printk("[OK] Audio (PDM 16kHz, 10Hz processing)\n");
 	}
 
 	/* --- SD Card --- */
-	err = sdcard_init();
-	if (err) {
-		printk("SD: init failed (err %d) — continuing without SD\n", err);
+	ret = sdcard_init();
+	if (ret) {
+		printk("[!!] SD init failed (%d)\n", ret);
+	} else {
+		printk("[OK] SD card\n");
 	}
 
 	/* --- Battery --- */
-	err = battery_init();
-	if (err) {
-		printk("BATT: init failed (err %d) — continuing without battery\n", err);
+	ret = battery_init();
+	if (ret) {
+		printk("[!!] Battery init failed (%d)\n", ret);
+	} else {
+		printk("[OK] Battery: %d mV (%d%%)\n",
+		       battery_millivolts(), battery_level_pct());
 	}
 
-	printk("\nReady! Connect via nRF Connect app.\n");
-	printk("IMU streams every 500ms. GPS/Mic/SD/Batt every 2s.\n\n");
+	/* --- BLE (advertising + NUS) --- */
+	ret = ble_adv_init(nus_rx_handler);
+	if (ret) {
+		printk("[!!] BLE init failed (%d)\n", ret);
+	} else {
+		printk("[OK] BLE advertising as \"%s\"\n", CONFIG_BT_DEVICE_NAME);
+	}
 
-	/* --- Main loop --- */
+	/* Boot complete — turn off blue LED */
+	gpio_pin_set_dt(&led_blue, 0);
+
+	printk("\n--- Running at 104 Hz ---\n\n");
+
+	/* ═══ Start 104 Hz timer ═══ */
+	k_timer_start(&imu_timer, K_USEC(IMU_PERIOD_US), K_USEC(IMU_PERIOD_US));
+
+	/* ═══ Main Loop (104 Hz) ═══ */
 	while (1) {
+		k_sem_take(&imu_tick, K_FOREVER);
 		cycle++;
 
-		gpio_pin_set_dt(&led_green, 1);
-
-		/* IMU */
-		if (imu && device_is_ready(imu)) {
-			read_and_send_imu(cycle);
+		/* ─── Check for pending NUS commands ─── */
+		if (k_sem_take(&cmd_sem, K_NO_WAIT) == 0) {
+			process_command(pending_cmd);
 		}
 
-		/* GPS — print every 2 seconds (every 4th cycle) */
-		if ((cycle % 4) == 0) {
-			struct gps_data gps;
-			char gps_str[128];
+		/* ─── IMU Read + Process ─── */
+		float ax_g = 0, ay_g = 0, az_g = 0;
+		float gx_dps = 0, gy_dps = 0, gz_dps = 0;
 
-			if (gps_get_data(&gps) == 0) {
-				gps_format(&gps, gps_str, sizeof(gps_str));
-				printk("[%d] %s\n", cycle, gps_str);
+		if (imu_ok) {
+			struct sensor_value accel[3], gyro[3];
 
-				/* Send GPS over BLE (fix or no-fix status) */
-				if (nus_notifications_enabled) {
-					int len = strlen(gps_str);
-					gps_str[len] = '\n';
-					bt_nus_send(NULL, (uint8_t *)gps_str, len + 1);
-				}
-			} else {
-				uint32_t nmea_count = gps_get_update_count();
-				if (nmea_count > 0) {
-					snprintf(gps_str, sizeof(gps_str),
-						"GPS: UART alive (%u NMEA msgs), parsing...\n",
-						nmea_count);
-				} else {
-					snprintf(gps_str, sizeof(gps_str),
-						"GPS: no NMEA data yet (check wiring)\n");
-				}
-				printk("[%d] %s", cycle, gps_str);
+			if (sensor_sample_fetch(imu) == 0) {
+				sensor_channel_get(imu, SENSOR_CHAN_ACCEL_X,
+						   &accel[0]);
+				sensor_channel_get(imu, SENSOR_CHAN_ACCEL_Y,
+						   &accel[1]);
+				sensor_channel_get(imu, SENSOR_CHAN_ACCEL_Z,
+						   &accel[2]);
+				sensor_channel_get(imu, SENSOR_CHAN_GYRO_X,
+						   &gyro[0]);
+				sensor_channel_get(imu, SENSOR_CHAN_GYRO_Y,
+						   &gyro[1]);
+				sensor_channel_get(imu, SENSOR_CHAN_GYRO_Z,
+						   &gyro[2]);
 
-				if (nus_notifications_enabled) {
-					bt_nus_send(NULL, (uint8_t *)gps_str,
-						strlen(gps_str));
-				}
-			}
+				ax_g = sv_to_g(&accel[0]);
+				ay_g = sv_to_g(&accel[1]);
+				az_g = sv_to_g(&accel[2]);
 
-			/* Mic — read one block of audio and report level */
-			struct mic_data mic;
-			bool mic_ok = (pdm_mic_read(&mic, 200) == 0);
-			if (mic_ok) {
-				char mic_str[64];
-				int n = snprintf(mic_str, sizeof(mic_str),
-					"MIC: rms=%u peak=%d lvl=%u%%\n",
-					mic.rms, mic.peak, mic.level_pct);
-				printk("[%d] %s", cycle, mic_str);
+				/* Apply gyro calibration offsets */
+				gx_dps = sv_to_dps(&gyro[0]) - gyro_off_x;
+				gy_dps = sv_to_dps(&gyro[1]) - gyro_off_y;
+				gz_dps = sv_to_dps(&gyro[2]) - gyro_off_z;
 
-				if (nus_notifications_enabled) {
-					bt_nus_send(NULL, (uint8_t *)mic_str, n);
-				}
-			}
+				/* Feed intensity tracker */
+				intensity_feed(ax_g, ay_g, az_g,
+					       gx_dps, gy_dps, gz_dps);
 
-			/* Battery — sample and report */
-			int batt_mv = 0, batt_pct = 0;
-			if (battery_sample() == 0) {
-				batt_mv = battery_millivolts();
-				batt_pct = battery_level_pct();
-				char batt_str[48];
-				int n = snprintf(batt_str, sizeof(batt_str),
-					"BATT: %d mV (%d%%)\n",
-					batt_mv, batt_pct);
-				printk("[%d] %s", cycle, batt_str);
-
-				if (nus_notifications_enabled) {
-					bt_nus_send(NULL, (uint8_t *)batt_str, n);
-				}
-			}
-
-			/* SD Card — log a summary line */
-			if (sdcard_is_mounted()) {
-				char sd_line[200];
-				struct gps_data gps_snap;
-				bool have_gps = (gps_get_data(&gps_snap) == 0);
-				int pos = 0;
-
-				pos += snprintf(sd_line + pos,
-					sizeof(sd_line) - pos,
-					"%lld,", k_uptime_get());
-				if (have_gps) {
-					pos += snprintf(sd_line + pos,
-						sizeof(sd_line) - pos,
-						"%.6f,%.6f,%d,%u,",
-						gps_snap.latitude_ndeg / 1e9,
-						gps_snap.longitude_ndeg / 1e9,
-						gps_snap.altitude_mm / 1000,
-						gps_snap.satellites);
-				} else {
-					pos += snprintf(sd_line + pos,
-						sizeof(sd_line) - pos,
-						",,,,");
-				}
-				snprintf(sd_line + pos,
-					sizeof(sd_line) - pos,
-					"%u,%d,%u,%d,%d",
-					mic_ok ? mic.rms : 0,
-					mic_ok ? mic.peak : 0,
-					mic_ok ? mic.level_pct : 0,
-					batt_mv, batt_pct);
-
-				sdcard_write_line(sd_line);
-
-				/* Flush every 10 seconds (5th write) */
-				if ((cycle % 20) == 0) {
-					sdcard_flush();
-				}
+				/* Feed IMU impact trigger */
+				float accel_mag = sqrtf(ax_g * ax_g +
+							ay_g * ay_g +
+							az_g * az_g);
+				impact_feed_imu(accel_mag);
 			}
 		}
 
-		gpio_pin_set_dt(&led_green, 0);
+		/* ─── SD Logging at 104 Hz (if active) ─── */
+		if (sdcard_is_logging()) {
+			format_and_log_csv(ax_g, ay_g, az_g,
+					   gx_dps, gy_dps, gz_dps);
+		}
 
-		k_msleep(500);
+		/* ─── 5 Hz BLE update (every 21 cycles ≈ 200ms) ─── */
+		if ((cycle % FAST_CYCLES) == 0) {
+			struct ble_packet pkt;
+
+			build_ble_packet(&pkt);
+			ble_adv_update(&pkt);
+		}
+
+		/* ─── 2 Hz tasks (every 52 cycles) ─── */
+		if ((cycle % SLOW_CYCLES) == 0) {
+			/* Intensity history sample */
+			intensity_sample_history();
+
+			/* LED update */
+			update_leds(cycle);
+
+			/* Console status (every ~4s = every 2nd slow cycle) */
+			if ((cycle % (SLOW_CYCLES * 2)) == 0) {
+				printk("[%u] INT:%.2f IMP:%u BAT:%dmV(%d%%)\n",
+				       cycle,
+				       (double)intensity_get_current(),
+				       impact_get_count(),
+				       battery_millivolts(),
+				       battery_level_pct());
+			}
+		}
+
+		/* ─── Battery read every 30s ─── */
+		if ((cycle % BATT_CYCLES) == 0) {
+			battery_sample();
+		}
 	}
 
 	return 0;

@@ -5,7 +5,10 @@ project(comotion_tracker)
 target_sources(app PRIVATE
   src/main.c
   src/gps.c
-  src/pdm_mic.c
+  src/audio.c
   src/sdcard.c
   src/battery.c
+  src/intensity.c
+  src/impact.c
+  src/ble_adv.c
 )
