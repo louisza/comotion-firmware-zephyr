@@ -55,8 +55,8 @@ static K_SEM_DEFINE(sd_flush_sem, 0, 1);
 static bool writer_running;
 
 /* ─── Log File ─── */
-#define CSV_HEADER "timestamp,ax,ay,az,gx,gy,gz,lat,lng,speed,course," \
-	"sats,audio_rms,audio_peak,audio_zcr,event\n"
+#define CSV_HEADER "timestamp,ax,ay,az,gx,gy,gz,lat,lng,lat_filt,lng_filt," \
+	"speed,course,sats,audio_rms,audio_peak,audio_zcr,event\n"
 
 static struct fs_file_t log_file;
 static bool file_open;

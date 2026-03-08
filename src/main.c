@@ -38,6 +38,7 @@
 #include "ble_adv.h"
 #include "gps.h"
 #include "battery.h"
+#include "filter.h"
 
 LOG_MODULE_REGISTER(main, CONFIG_LOG_DEFAULT_LEVEL);
 
@@ -82,6 +83,14 @@ static float max_speed_kmh;
 
 /* ─── LED state ─── */
 static int64_t event_flash_off;
+
+/* ─── IMU low-pass filters (per-axis EMA, α=0.3 → ~5 Hz cutoff at 104 Hz) ─── */
+static struct filter_ema filt_ax = FILTER_EMA_INIT(0.3f);
+static struct filter_ema filt_ay = FILTER_EMA_INIT(0.3f);
+static struct filter_ema filt_az = FILTER_EMA_INIT(0.3f);
+static struct filter_ema filt_gx = FILTER_EMA_INIT(0.3f);
+static struct filter_ema filt_gy = FILTER_EMA_INIT(0.3f);
+static struct filter_ema filt_gz = FILTER_EMA_INIT(0.3f);
 
 /* ─── Deferred NUS command processing ─── */
 static char pending_cmd[64];
@@ -454,12 +463,13 @@ static void build_ble_packet(struct ble_packet *pkt)
 	pkt->intensity_10min = (uint16_t)i10_enc;
 
 	/*
-	 * GPS speed — capped at 200 km/h to prevent garbage from corrupting max.
+	 * GPS speed — uses Kalman-filtered speed for cleaner BLE output.
+	 * Capped at 200 km/h to prevent garbage from corrupting max.
 	 * Additional guards: require fix_quality > 0 (valid fix) and HDOP < 5000
 	 * (< 5.0) to reject wild speed values from early converging fixes.
 	 */
 	if (have_gps && gps.fix_quality > 0 && gps.hdop > 0 && gps.hdop < 5000) {
-		uint32_t speed_capped = MIN(gps.speed_mmps, 55556u);
+		uint32_t speed_capped = MIN(gps.speed_filt_mmps, 55556u);
 		float speed_kmh = (float)speed_capped * 0.0036f;
 
 		pkt->speed_now = (uint8_t)MIN(speed_kmh * 2.0f, 255.0f);
@@ -469,7 +479,7 @@ static void build_ble_packet(struct ble_packet *pkt)
 		}
 	} else if (have_gps) {
 		/* Have fix but low quality — show speed_now but don't update max */
-		uint32_t speed_capped = MIN(gps.speed_mmps, 55556u);
+		uint32_t speed_capped = MIN(gps.speed_filt_mmps, 55556u);
 		float speed_kmh = (float)speed_capped * 0.0036f;
 
 		pkt->speed_now = (uint8_t)MIN(speed_kmh * 2.0f, 255.0f);
@@ -518,29 +528,32 @@ static void build_ble_packet(struct ble_packet *pkt)
 	pkt->audio_peak = (uint8_t)MIN(aud.peak / 128, 255);
 
 	/* GPS position — absolute int32 in deci-microdegrees (×10⁷).
+	 * Uses EMA-filtered position for cleaner BLE output.
 	 * App decodes: degrees = latitude / 10000000.0
 	 * Range: ±214.7° (full globe), precision: ~1.1 cm.
 	 * Simple integer divide from nanodegrees: ndeg / 100.
 	 */
 	if (have_gps) {
-		pkt->latitude  = (int32_t)(gps.latitude_ndeg / 100LL);
-		pkt->longitude = (int32_t)(gps.longitude_ndeg / 100LL);
+		pkt->latitude  = (int32_t)(gps.latitude_filt_ndeg / 100LL);
+		pkt->longitude = (int32_t)(gps.longitude_filt_ndeg / 100LL);
 	} else {
 		pkt->latitude  = GPS_NO_FIX;
 		pkt->longitude = GPS_NO_FIX;
 	}
 
-	/* Bearing: millidegrees → ×10 (0–3600 for 0.0–360.0°) */
+	/* Bearing: filtered millidegrees → ×10 (0–3600 for 0.0–360.0°) */
 	if (have_gps) {
-		pkt->bearing = (uint16_t)MIN(gps.bearing_mdeg / 100u, 3600u);
+		pkt->bearing = (uint16_t)MIN(gps.bearing_filt_mdeg / 100u, 3600u);
 	}
 
-	/* HDOP: milli-DOP → ×10 (e.g. 1200 → 12 = 1.2 HDOP) */
-	if (gps_ok) {
+	/* HDOP: milli-DOP → ×10 (e.g. 1200 → 12 = 1.2 HDOP)
+	 * Only meaningful when we have a current, valid fix.
+	 */
+	if (have_gps) {
 		pkt->hdop = (uint8_t)MIN(gps.hdop / 100u, 255u);
 	}
 
-	/* Fix quality: 0=invalid, 1=SPS, 2=DGNSS, etc. */
+	/* Fix quality: always report so app can see 0=no-fix vs 1=SPS etc. */
 	if (gps_ok) {
 		pkt->fix_quality = gps.fix_quality;
 	}
@@ -577,15 +590,17 @@ static void format_and_log_csv(float ax, float ay, float az,
 	if (csv_have_gps) {
 		double lat = (double)csv_gps.latitude_ndeg / 1e9;
 		double lng = (double)csv_gps.longitude_ndeg / 1e9;
+		double lat_filt = (double)csv_gps.latitude_filt_ndeg / 1e9;
+		double lng_filt = (double)csv_gps.longitude_filt_ndeg / 1e9;
 		float speed = (float)csv_gps.speed_mmps * 0.0036f;
 		float course = (float)csv_gps.bearing_mdeg / 1000.0f;
 
 		pos += snprintf(line + pos, sizeof(line) - pos,
-				"%.6f,%.6f,%.1f,%.1f,%u,",
-				lat, lng, (double)speed, (double)course,
+				"%.6f,%.6f,%.6f,%.6f,%.1f,%.1f,%u,",
+				lat, lng, lat_filt, lng_filt, (double)speed, (double)course,
 				csv_gps.satellites);
 	} else {
-		pos += snprintf(line + pos, sizeof(line) - pos, ",,,,,");
+		pos += snprintf(line + pos, sizeof(line) - pos, ",,,,,,");
 	}
 
 	/* Audio: rms, peak, zcr */
@@ -754,14 +769,30 @@ int main(void)
 				gy_dps = sv_to_dps(&gyro[1]) - gyro_off_y;
 				gz_dps = sv_to_dps(&gyro[2]) - gyro_off_z;
 
-				/* Feed intensity tracker */
-				intensity_feed(ax_g, ay_g, az_g,
-					       gx_dps, gy_dps, gz_dps);
+				/*
+				 * Low-pass filter: per-axis EMA (α=0.3,
+				 * ~5 Hz cutoff at 104 Hz sample rate).
+				 * Removes sensor noise and vibration
+				 * while preserving motion dynamics.
+				 *
+				 * Raw values (ax_g etc.) are preserved
+				 * for SD card CSV logging.
+				 */
+				float fax = filter_ema_update(&filt_ax, ax_g);
+				float fay = filter_ema_update(&filt_ay, ay_g);
+				float faz = filter_ema_update(&filt_az, az_g);
+				float fgx = filter_ema_update(&filt_gx, gx_dps);
+				float fgy = filter_ema_update(&filt_gy, gy_dps);
+				float fgz = filter_ema_update(&filt_gz, gz_dps);
 
-				/* Feed IMU impact trigger */
-				float accel_mag = sqrtf(ax_g * ax_g +
-							ay_g * ay_g +
-							az_g * az_g);
+				/* Feed FILTERED values to intensity tracker */
+				intensity_feed(fax, fay, faz,
+					       fgx, fgy, fgz);
+
+				/* Feed FILTERED magnitude to impact detector */
+				float accel_mag = sqrtf(fax * fax +
+							fay * fay +
+							faz * faz);
 				impact_feed_imu(accel_mag);
 			}
 		}

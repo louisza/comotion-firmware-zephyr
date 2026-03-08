@@ -4,10 +4,10 @@
  * Dual-advertising architecture for maximum range on a hockey field:
  *
  *   Set 1 — BROADCAST (Coded PHY, non-connectable)
- *     • 20-byte manufacturer data with live telemetry
+ *     • 27-byte manufacturer data with live telemetry
  *     • Always running, even during a connection
  *     • Coded PHY S=8 for ~4× range over 1M PHY
- *     • Updated at 2 Hz (normal) or 10 Hz (focus)
+ *     • Updated at 5 Hz (normal) or ~20 Hz (focus)
  *
  *   Set 2 — CONNECTABLE (1M PHY)
  *     • Advertises NUS UUID so phones can connect for commands
@@ -39,21 +39,20 @@ LOG_MODULE_REGISTER(ble_adv, CONFIG_LOG_DEFAULT_LEVEL);
 #define CONN_ADV_INTERVAL       800     /* 500ms for connectable set */
 #define FOCUS_TIMEOUT_MS        60000
 
-/* ─── Manufacturer data: 2-byte company ID + 23-byte payload ─── */
+/* ─── Manufacturer data: 2-byte company ID + 27-byte payload ─── */
 static uint8_t mfg_data[2 + sizeof(struct ble_packet)];
 
 /* ─── Extended advertising sets ─── */
 static struct bt_le_ext_adv *bcast_adv;   /* Coded PHY broadcast */
 static struct bt_le_ext_adv *conn_adv;    /* 1M connectable for NUS */
+static bool bcast_running;                /* true when broadcast set is active */
 
 /* ─── Broadcast advertising data (Coded PHY, non-connectable) ─── */
-/* Only manufacturer data needed — phone app reads MfgData via passive scan.
- * Keeping this minimal reduces Coded PHY air time and stays well within
- * CONFIG_BT_CTLR_ADV_DATA_LEN_MAX. Flags and name are on the connectable set.
+/* No Flags — Flags SHALL NOT be present in non-connectable extended
+ * advertising (BT Core Spec Vol 3, Part C, §11.1.3).
+ * Device name IS included so the app can identify CoMotion broadcasts.
  */
 static struct bt_data bcast_ad[] = {
-	BT_DATA_BYTES(BT_DATA_FLAGS,
-		      (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
 	BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME,
 		sizeof(CONFIG_BT_DEVICE_NAME) - 1),
 	BT_DATA(BT_DATA_MANUFACTURER_DATA, mfg_data, sizeof(mfg_data)),
@@ -97,7 +96,9 @@ static void conn_adv_restart_handler(struct k_work *work)
 		conn_adv_started = true;
 		LOG_INF("BLE: connectable adv restarted");
 	} else {
-		LOG_ERR("BLE: connectable adv restart failed: %d", ret);
+		LOG_WRN("BLE: connectable adv restart failed: %d, "
+			"retrying in 1s", ret);
+		k_work_schedule(&conn_adv_restart_work, K_SECONDS(1));
 	}
 }
 
@@ -191,6 +192,7 @@ static int update_broadcast_interval(uint16_t interval)
 
 	/* Must stop → reconfigure → restart to change interval */
 	bt_le_ext_adv_stop(bcast_adv);
+	bcast_running = false;
 
 	struct bt_le_adv_param param = BT_LE_ADV_PARAM_INIT(
 		BT_LE_ADV_OPT_EXT_ADV | BT_LE_ADV_OPT_CODED,
@@ -199,16 +201,26 @@ static int update_broadcast_interval(uint16_t interval)
 	ret = bt_le_ext_adv_update_param(bcast_adv, &param);
 	if (ret) {
 		LOG_ERR("BLE: broadcast param update failed: %d", ret);
-		return ret;
+		/* Fall through — try to restart with old params rather
+		 * than leaving the broadcast permanently stopped.
+		 */
 	}
 
-	ret = bt_le_ext_adv_start(bcast_adv, BT_LE_EXT_ADV_START_DEFAULT);
-	if (ret) {
-		LOG_ERR("BLE: broadcast restart failed: %d", ret);
-		return ret;
+	/* Retry start up to 3 times — radio may be busy with other set */
+	for (int attempt = 0; attempt < 3; attempt++) {
+		ret = bt_le_ext_adv_start(bcast_adv,
+					  BT_LE_EXT_ADV_START_DEFAULT);
+		if (ret == 0 || ret == -EALREADY) {
+			bcast_running = true;
+			return 0;
+		}
+		LOG_WRN("BLE: broadcast restart attempt %d/3 failed: %d",
+			attempt + 1, ret);
+		k_msleep(10);
 	}
 
-	return 0;
+	LOG_ERR("BLE: broadcast restart FAILED — will recover on next update");
+	return ret;
 }
 
 /* ─── Public API ─── */
@@ -265,8 +277,9 @@ int ble_adv_init(void (*rx_cb)(struct bt_conn *, const uint8_t *, uint16_t))
 		LOG_ERR("BLE: broadcast start failed: %d", ret);
 		return ret;
 	}
+	bcast_running = true;
 
-	LOG_INF("BLE: broadcast started (Coded PHY, 500ms)");
+	LOG_INF("BLE: broadcast started (Coded PHY, 200ms)");
 
 	/* ─── Set 2: 1M connectable (for NUS commands) ─── */
 	struct bt_le_adv_param conn_param = BT_LE_ADV_PARAM_INIT(
@@ -309,15 +322,30 @@ void ble_adv_update(const struct ble_packet *pkt)
 		update_broadcast_interval(ADV_INTERVAL_NORMAL);
 	}
 
+	/* If broadcast died (e.g. failed restart), try to recover */
+	if (!bcast_running) {
+		int rc = bt_le_ext_adv_start(bcast_adv,
+					     BT_LE_EXT_ADV_START_DEFAULT);
+		if (rc == 0 || rc == -EALREADY) {
+			bcast_running = true;
+			LOG_INF("BLE: broadcast recovered");
+		}
+	}
+
 	/* Copy packet into manufacturer data (after the 2-byte company ID) */
 	memcpy(&mfg_data[2], pkt, sizeof(struct ble_packet));
 
-	/* Update broadcast advertising data in-place */
+	/* Push updated data to the controller */
 	int ret = bt_le_ext_adv_set_data(bcast_adv,
 					 bcast_ad, ARRAY_SIZE(bcast_ad),
 					 NULL, 0);
-	if (ret && ret != -EAGAIN) {
-		LOG_DBG("BLE: broadcast update: %d", ret);
+	if (ret == -EAGAIN) {
+		/* Controller mid-TX — data is in mfg_data and will be
+		 * picked up on the next call (~200ms later at worst).
+		 */
+	} else if (ret) {
+		LOG_WRN("BLE: set_data failed: %d — marking for recovery", ret);
+		bcast_running = false;
 	}
 }
 
@@ -361,10 +389,21 @@ void ble_adv_nus_send(const char *msg)
 
 	while (off < len) {
 		int chunk = MIN(20, len - off);
-		int ret = bt_nus_send(current_conn,
-				      (const uint8_t *)msg + off, chunk);
+		int ret = -ENOMEM;
+
+		/* Retry up to 3 times on TX buffer full (-ENOMEM) */
+		for (int attempt = 0; attempt < 3; attempt++) {
+			ret = bt_nus_send(current_conn,
+					  (const uint8_t *)msg + off, chunk);
+			if (ret != -ENOMEM) {
+				break;
+			}
+			k_msleep(10);
+		}
+
 		if (ret) {
-			LOG_DBG("NUS send err: %d", ret);
+			LOG_WRN("NUS send failed: %d (dropped %d/%d bytes)",
+				ret, len - off, len);
 			return;
 		}
 		off += chunk;

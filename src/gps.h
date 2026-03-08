@@ -29,14 +29,22 @@ struct gps_data {
 	uint32_t hdop;             /* HDOP × 1000 (e.g. 1500 = 1.5)         */
 	uint8_t  fix_quality;      /* GNSS_FIX_QUALITY_* (0=invalid, 1=SPS…) */
 
-	/* Position — frozen at last valid fix, never cleared */
+	/* Position — frozen at last valid fix, never cleared (RAW) */
 	int64_t  latitude_ndeg;    /* nanodegrees (÷ 1e9 → degrees)          */
 	int64_t  longitude_ndeg;   /* nanodegrees                            */
 	int32_t  altitude_mm;      /* millimeters above MSL                  */
 
-	/* Dynamics — frozen at last valid fix */
+	/* Position — filtered (EMA-smoothed, outlier-rejected) */
+	int64_t  latitude_filt_ndeg;
+	int64_t  longitude_filt_ndeg;
+
+	/* Dynamics — frozen at last valid fix (RAW) */
 	uint32_t speed_mmps;       /* millimeters per second                 */
 	uint32_t bearing_mdeg;     /* millidegrees (0–360000)                */
+
+	/* Dynamics — filtered */
+	uint32_t speed_filt_mmps;  /* Kalman-filtered speed (mm/s)           */
+	uint32_t bearing_filt_mdeg;/* circular-EMA-filtered bearing (mdeg)   */
 
 	/* UTC time (from latest NMEA sentence, valid even without fix) */
 	uint8_t  hour;
