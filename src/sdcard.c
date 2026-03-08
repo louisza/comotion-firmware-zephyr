@@ -541,25 +541,35 @@ void sdcard_handle_dump(const char *filename)
 	ble_adv_nus_send(header);
 	k_msleep(50); /* Let app process the header */
 
-	/* Send binary chunks: [seq_u16_le][payload_240] */
+	/* Send file as text lines — each CSV line sent via ble_send (20-byte NUS chunks + \n) */
 	transfer_abort = false;
-	uint16_t seq = 0;
-	uint8_t chunk[242]; /* 2 byte seq + 240 byte payload */
 	uint32_t total_sent = 0;
+	char line_buf[256];
+	int line_pos = 0;
 
 	while (!transfer_abort) {
-		int n = fs_read(&f, &chunk[2], 240);
+		char c;
+		int n = fs_read(&f, &c, 1);
 		if (n <= 0) break;
 
-		chunk[0] = seq & 0xFF;
-		chunk[1] = (seq >> 8) & 0xFF;
-
-		ble_adv_nus_send_raw(chunk, 2 + n);
-		total_sent += n;
-		seq++;
-
-		/* Pace: ~5 KB/s, yield between chunks */
-		k_msleep(2);
+		if (c == '\n' || line_pos >= (int)sizeof(line_buf) - 2) {
+			line_buf[line_pos] = '\0';
+			if (line_pos > 0) {
+				/* Send as text with newline terminator via ble_send */
+				ble_adv_nus_send(line_buf);
+				total_sent += line_pos + 1; /* +1 for newline */
+			}
+			line_pos = 0;
+			k_msleep(2); /* Pace output */
+		} else {
+			line_buf[line_pos++] = c;
+		}
+	}
+	/* Send any remaining partial line */
+	if (line_pos > 0 && !transfer_abort) {
+		line_buf[line_pos] = '\0';
+		ble_adv_nus_send(line_buf);
+		total_sent += line_pos;
 	}
 
 	fs_close(&f);
