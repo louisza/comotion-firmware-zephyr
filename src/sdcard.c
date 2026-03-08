@@ -41,6 +41,10 @@ static char write_buffer[SD_BUFFER_SIZE];
 /* ─── Event ─── */
 static char current_event[32];
 
+/* ─── Transfer state ─── */
+static volatile bool transfer_abort;
+static char last_log_filename[32];
+
 /* ═══════════════════════════════════════════════════════════════
  * Ring Buffer (verbatim from Arduino firmware)
  * ═══════════════════════════════════════════════════════════════ */
@@ -124,6 +128,7 @@ bool sdcard_start_logging(void)
 	g_move_count = 0;
 
 	g_is_logging = true;
+	strncpy(last_log_filename, log_filename, sizeof(last_log_filename));
 	LOG_INF("[LOG] Started: %s", log_filename);
 	return true;
 }
@@ -229,4 +234,272 @@ void sdcard_mark_event(const char *name)
 	strncpy(current_event, name, sizeof(current_event) - 1);
 	current_event[sizeof(current_event) - 1] = '\0';
 	LOG_INF("[EVENT] %s", current_event);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * Log Transfer — NUS commands for BLE download pipeline
+ * ═══════════════════════════════════════════════════════════════ */
+
+/* Forward: send string over NUS */
+extern void ble_send(const char *msg);
+/* Forward: send raw binary over NUS */
+extern void ble_send_raw(const uint8_t *data, uint16_t len);
+
+/**
+ * Scan first/last bytes of a CSV file to find GPS timestamps.
+ * Returns first valid timestamp in *start, last in *end (Unix epoch).
+ * Returns 0 if not found.
+ *
+ * Looks for the "timestamp" column (column 0) — a numeric Unix epoch ms value.
+ * Converts ms → seconds for the epoch.
+ */
+static void scan_file_timestamps(const char *path, int64_t *start, int64_t *end)
+{
+	struct fs_file_t f;
+	fs_file_t_init(&f);
+	*start = 0;
+	*end = 0;
+
+	if (fs_open(&f, path, FS_O_READ) != 0) return;
+
+	struct fs_dirent entry;
+	if (fs_stat(path, &entry) != 0) {
+		fs_close(&f);
+		return;
+	}
+
+	/* Read first 512 bytes to find first timestamp */
+	char buf[512];
+	int n = fs_read(&f, buf, sizeof(buf));
+	if (n > 0) {
+		/* Skip header line */
+		char *p = memchr(buf, '\n', n);
+		if (p && p < buf + n - 1) {
+			p++; /* Start of second line */
+			/* Parse first field (timestamp) */
+			char *comma = memchr(p, ',', buf + n - p);
+			if (comma) {
+				char tmp[20];
+				int len = MIN(comma - p, (int)sizeof(tmp) - 1);
+				memcpy(tmp, p, len);
+				tmp[len] = '\0';
+				int64_t ts = strtoll(tmp, NULL, 10);
+				if (ts > 1000000000000LL) ts /= 1000; /* ms → s */
+				if (ts > 1600000000) *start = ts;
+			}
+		}
+	}
+
+	/* Read last 1024 bytes to find last timestamp */
+	off_t fsize = entry.size;
+	off_t seek_pos = (fsize > 1024) ? fsize - 1024 : 0;
+	fs_seek(&f, seek_pos, FS_SEEK_SET);
+
+	char buf2[1024];
+	n = fs_read(&f, buf2, sizeof(buf2));
+	if (n > 0) {
+		/* Find last complete line */
+		char *last_nl = NULL;
+		char *prev_nl = NULL;
+		for (int i = n - 2; i >= 0; i--) {
+			if (buf2[i] == '\n') {
+				if (!last_nl) {
+					last_nl = &buf2[i];
+				} else {
+					prev_nl = &buf2[i];
+					break;
+				}
+			}
+		}
+		char *line_start = prev_nl ? prev_nl + 1 : buf2;
+		if (last_nl && line_start < last_nl) {
+			char *comma = memchr(line_start, ',', last_nl - line_start);
+			if (comma) {
+				char tmp[20];
+				int len = MIN(comma - line_start, (int)sizeof(tmp) - 1);
+				memcpy(tmp, line_start, len);
+				tmp[len] = '\0';
+				int64_t ts = strtoll(tmp, NULL, 10);
+				if (ts > 1000000000000LL) ts /= 1000;
+				if (ts > 1600000000) *end = ts;
+			}
+		}
+	}
+
+	fs_close(&f);
+}
+
+void sdcard_handle_list(void)
+{
+	if (!sd_mounted) {
+		ble_send("ERR:SD not mounted");
+		return;
+	}
+
+	struct fs_dir_t dir;
+	fs_dir_t_init(&dir);
+
+	if (fs_opendir(&dir, "/SD:") != 0) {
+		ble_send("ERR:Cannot open SD dir");
+		return;
+	}
+
+	struct fs_dirent entry;
+	while (fs_readdir(&dir, &entry) == 0 && entry.name[0] != '\0') {
+		/* Only list .CSV files */
+		int nlen = strlen(entry.name);
+		if (nlen < 5) continue;
+		if (strcasecmp(&entry.name[nlen - 4], ".CSV") != 0) continue;
+
+		/* Scan for timestamps */
+		char fullpath[48];
+		snprintf(fullpath, sizeof(fullpath), "/SD:/%s", entry.name);
+
+		int64_t ts_start = 0, ts_end = 0;
+		scan_file_timestamps(fullpath, &ts_start, &ts_end);
+
+		char msg[128];
+		snprintf(msg, sizeof(msg), "FILE:%s,%u,%lld,%lld",
+			 entry.name, (unsigned)entry.size, ts_start, ts_end);
+		ble_send(msg);
+	}
+
+	fs_closedir(&dir);
+	ble_send("END_LIST");
+}
+
+void sdcard_handle_dump(const char *filename)
+{
+	if (!sd_mounted) {
+		ble_send("ERR:SD not mounted");
+		return;
+	}
+
+	char fullpath[48];
+	snprintf(fullpath, sizeof(fullpath), "/SD:/%s", filename);
+
+	struct fs_dirent entry;
+	if (fs_stat(fullpath, &entry) != 0) {
+		ble_send("ERR:File not found");
+		return;
+	}
+
+	struct fs_file_t f;
+	fs_file_t_init(&f);
+	if (fs_open(&f, fullpath, FS_O_READ) != 0) {
+		ble_send("ERR:Cannot open file");
+		return;
+	}
+
+	/* Send transfer header */
+	char header[64];
+	snprintf(header, sizeof(header), "XFER:%s,%u,0", filename, (unsigned)entry.size);
+	ble_send(header);
+	k_msleep(50); /* Let app process the header */
+
+	/* Send binary chunks: [seq_u16_le][payload_240] */
+	transfer_abort = false;
+	uint16_t seq = 0;
+	uint8_t chunk[242]; /* 2 byte seq + 240 byte payload */
+	uint32_t total_sent = 0;
+
+	while (!transfer_abort) {
+		int n = fs_read(&f, &chunk[2], 240);
+		if (n <= 0) break;
+
+		chunk[0] = seq & 0xFF;
+		chunk[1] = (seq >> 8) & 0xFF;
+
+		ble_send_raw(chunk, 2 + n);
+		total_sent += n;
+		seq++;
+
+		/* Pace: ~5 KB/s, yield between chunks */
+		k_msleep(2);
+	}
+
+	fs_close(&f);
+
+	if (transfer_abort) {
+		ble_send("ERR:Transfer aborted");
+	} else {
+		char footer[64];
+		snprintf(footer, sizeof(footer), "END_DUMP:%u,0", total_sent);
+		ble_send(footer);
+	}
+}
+
+void sdcard_handle_dump_latest(void)
+{
+	if (last_log_filename[0] != '\0') {
+		/* Strip /SD:/ prefix for the dump handler */
+		const char *name = last_log_filename;
+		if (strncmp(name, "/SD:/", 5) == 0) name += 5;
+		sdcard_handle_dump(name);
+	} else {
+		ble_send("ERR:No logs recorded yet");
+	}
+}
+
+void sdcard_handle_delete(const char *filename)
+{
+	if (!sd_mounted) {
+		ble_send("ERR:SD not mounted");
+		return;
+	}
+
+	/* Don't delete the file currently being written */
+	char fullpath[48];
+	snprintf(fullpath, sizeof(fullpath), "/SD:/%s", filename);
+	if (g_is_logging && strcmp(fullpath, log_filename) == 0) {
+		ble_send("ERR:Cannot delete active log");
+		return;
+	}
+
+	if (fs_unlink(fullpath) == 0) {
+		ble_send("OK");
+	} else {
+		ble_send("ERR:Delete failed");
+	}
+}
+
+void sdcard_handle_status_cmd(void)
+{
+	if (!sd_mounted) {
+		ble_send("ERR:SD not mounted");
+		return;
+	}
+
+	struct fs_statvfs stat;
+	if (fs_statvfs("/SD:", &stat) != 0) {
+		ble_send("ERR:Cannot read SD stats");
+		return;
+	}
+
+	uint32_t free_kb = (stat.f_bfree * stat.f_frsize) / 1024;
+	uint32_t total_kb = (stat.f_blocks * stat.f_frsize) / 1024;
+
+	/* Count CSV files */
+	struct fs_dir_t dir;
+	fs_dir_t_init(&dir);
+	int file_count = 0;
+	if (fs_opendir(&dir, "/SD:") == 0) {
+		struct fs_dirent entry;
+		while (fs_readdir(&dir, &entry) == 0 && entry.name[0] != '\0') {
+			int nlen = strlen(entry.name);
+			if (nlen >= 5 && strcasecmp(&entry.name[nlen - 4], ".CSV") == 0) {
+				file_count++;
+			}
+		}
+		fs_closedir(&dir);
+	}
+
+	char msg[64];
+	snprintf(msg, sizeof(msg), "SD:%u,%u,%d", free_kb, total_kb, file_count);
+	ble_send(msg);
+}
+
+void sdcard_handle_abort(void)
+{
+	transfer_abort = true;
 }

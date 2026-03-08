@@ -162,6 +162,20 @@ void process_command(const char *cmd)
 		ble_send(msg);
 	} else if (strcmp(cmd, "ping") == 0) {
 		ble_send("pong");
+	} else if (strcmp(cmd, "LIST") == 0) {
+		sdcard_handle_list();
+	} else if (strncmp(cmd, "DUMP:", 5) == 0) {
+		sdcard_handle_dump(cmd + 5);
+	} else if (strcmp(cmd, "DUMP_LATEST") == 0) {
+		sdcard_handle_dump_latest();
+	} else if (strncmp(cmd, "DELETE:", 7) == 0) {
+		sdcard_handle_delete(cmd + 7);
+	} else if (strcmp(cmd, "STATUS") == 0) {
+		sdcard_handle_status_cmd();
+	} else if (strcmp(cmd, "ABORT") == 0) {
+		sdcard_handle_abort();
+	} else if (strncmp(cmd, "ACK:", 4) == 0) {
+		/* ACK from app during transfer — just ignore (pacing handled in dump) */
 	} else {
 		ble_send("ERR:Unknown command");
 	}

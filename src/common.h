@@ -47,7 +47,7 @@
 #define BLE_ADV_INTERVAL_NORMAL 500
 #define BLE_ADV_INTERVAL_FOCUS  100
 #define IMPACT_FLAG_DURATION_MS 2000
-#define ADV_DATA_LEN            20
+#define ADV_DATA_LEN            27  /* v2.1: 27-byte payload */
 
 /* ─── Status flags (byte 0 of advertising data) ─── */
 #define STATUS_FLAG_LOGGING     0x01

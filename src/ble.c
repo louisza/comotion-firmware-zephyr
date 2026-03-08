@@ -35,8 +35,8 @@ static struct bt_conn *current_conn;
 static bool ble_connected;
 static int64_t impact_flag_time;
 
-/* ─── Manufacturer data: 2 bytes company ID + 20 bytes payload ─── */
-static uint8_t mfg_data[22];
+/* ─── Manufacturer data: 2 bytes company ID + 27 bytes payload (v2.1) ─── */
+static uint8_t mfg_data[29];
 
 /* ─── Advertising data arrays ─── */
 static struct bt_data ad_legacy[] = {
@@ -240,6 +240,20 @@ void ble_send(const char *msg)
 	bt_nus_send(current_conn, (const uint8_t *)"\n", 1);
 }
 
+void ble_send_raw(const uint8_t *data, uint16_t len)
+{
+	if (!current_conn) return;
+
+	/* Send in MTU-sized chunks (default 20 if MTU not negotiated) */
+	uint16_t offset = 0;
+	while (offset < len) {
+		uint16_t chunk = MIN(240, len - offset);
+		bt_nus_send(current_conn, data + offset, chunk);
+		offset += chunk;
+		if (offset < len) k_msleep(2);
+	}
+}
+
 void ble_set_impact_flag(void)
 {
 	impact_flag_time = k_uptime_get();
@@ -306,22 +320,37 @@ void ble_update_advertising(void)
 	d[13] = (session_sec >> 8) & 0xFF;
 	d[14] = audio_peak_scaled;
 
-	/* GPS position: int16 offsets from field center */
+	/* GPS position: int32 absolute × 10^7 (v2.1 format) */
 	if (g_gps.valid) {
-		int16_t lat_off = (int16_t)CLAMP(
-			(g_gps.latitude - FIELD_CENTER_LAT) * 100000.0, -32767, 32767);
-		int16_t lng_off = (int16_t)CLAMP(
-			(g_gps.longitude - FIELD_CENTER_LNG) * 100000.0, -32767, 32767);
-		d[15] = lat_off & 0xFF;
-		d[16] = (lat_off >> 8) & 0xFF;
-		d[17] = lng_off & 0xFF;
-		d[18] = (lng_off >> 8) & 0xFF;
+		int32_t lat_i32 = (int32_t)(g_gps.latitude * 10000000.0);
+		int32_t lng_i32 = (int32_t)(g_gps.longitude * 10000000.0);
+		d[15] = lat_i32 & 0xFF;
+		d[16] = (lat_i32 >> 8) & 0xFF;
+		d[17] = (lat_i32 >> 16) & 0xFF;
+		d[18] = (lat_i32 >> 24) & 0xFF;
+		d[19] = lng_i32 & 0xFF;
+		d[20] = (lng_i32 >> 8) & 0xFF;
+		d[21] = (lng_i32 >> 16) & 0xFF;
+		d[22] = (lng_i32 >> 24) & 0xFF;
 	} else {
-		/* Sentinel: 0x7FFF = no position */
-		d[15] = 0xFF; d[16] = 0x7F;
-		d[17] = 0xFF; d[18] = 0x7F;
+		/* Sentinel: 0x7FFFFFFF = no position */
+		d[15] = 0xFF; d[16] = 0xFF; d[17] = 0xFF; d[18] = 0x7F;
+		d[19] = 0xFF; d[20] = 0xFF; d[21] = 0xFF; d[22] = 0x7F;
 	}
-	d[19] = 0;
+
+	/* Bearing (byte 23): course / 2, so 0–180 maps to 0°–360° */
+	d[23] = g_gps.valid ? (uint8_t)CLAMP((int)(g_gps.course / 2.0f), 0, 180) : 0;
+
+	/* HDOP (byte 24): HDOP × 10 (0 = unknown) */
+	d[24] = 0; /* TODO: parse HDOP from NMEA when available */
+
+	/* Fix quality (byte 25): satellites in upper nibble, fix type in lower */
+	d[25] = g_gps.valid
+		? (uint8_t)(((CLAMP(g_gps.satellites, 0, 15) & 0x0F) << 4) | 0x01)
+		: 0;
+
+	/* Reserved (byte 26) */
+	d[26] = 0;
 
 	/* Update both advertising sets — no stop/start needed! */
 	bt_le_ext_adv_set_data(adv_legacy, ad_legacy, ARRAY_SIZE(ad_legacy),
