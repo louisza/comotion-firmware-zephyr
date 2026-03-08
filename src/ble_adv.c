@@ -384,7 +384,12 @@ void ble_adv_nus_send(const char *msg)
 		return;
 	}
 
-	int len = strlen(msg);
+	/* Send message + newline terminator so app can detect line boundaries */
+	char buf[258];
+	int len = snprintf(buf, sizeof(buf), "%s\n", msg);
+	if (len <= 0 || len >= (int)sizeof(buf)) {
+		return;
+	}
 	int off = 0;
 
 	while (off < len) {
@@ -394,7 +399,7 @@ void ble_adv_nus_send(const char *msg)
 		/* Retry up to 3 times on TX buffer full (-ENOMEM) */
 		for (int attempt = 0; attempt < 3; attempt++) {
 			ret = bt_nus_send(current_conn,
-					  (const uint8_t *)msg + off, chunk);
+					  (const uint8_t *)buf + off, chunk);
 			if (ret != -ENOMEM) {
 				break;
 			}
