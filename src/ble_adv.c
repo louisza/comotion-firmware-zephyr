@@ -195,7 +195,7 @@ static int update_broadcast_interval(uint16_t interval)
 	bcast_running = false;
 
 	struct bt_le_adv_param param = BT_LE_ADV_PARAM_INIT(
-		BT_LE_ADV_OPT_EXT_ADV | BT_LE_ADV_OPT_CODED,
+		BT_LE_ADV_OPT_EXT_ADV | BT_LE_ADV_OPT_CODED | BT_LE_ADV_OPT_USE_IDENTITY,
 		interval, interval, NULL);
 
 	ret = bt_le_ext_adv_update_param(bcast_adv, &param);
@@ -255,7 +255,7 @@ int ble_adv_init(void (*rx_cb)(struct bt_conn *, const uint8_t *, uint16_t))
 
 	/* ─── Set 1: Coded PHY broadcast (non-connectable, always on) ─── */
 	struct bt_le_adv_param bcast_param = BT_LE_ADV_PARAM_INIT(
-		BT_LE_ADV_OPT_EXT_ADV | BT_LE_ADV_OPT_CODED,
+		BT_LE_ADV_OPT_EXT_ADV | BT_LE_ADV_OPT_CODED | BT_LE_ADV_OPT_USE_IDENTITY,
 		ADV_INTERVAL_NORMAL, ADV_INTERVAL_NORMAL, NULL);
 
 	ret = bt_le_ext_adv_create(&bcast_param, NULL, &bcast_adv);
@@ -283,7 +283,7 @@ int ble_adv_init(void (*rx_cb)(struct bt_conn *, const uint8_t *, uint16_t))
 
 	/* ─── Set 2: 1M connectable (for NUS commands) ─── */
 	struct bt_le_adv_param conn_param = BT_LE_ADV_PARAM_INIT(
-		BT_LE_ADV_OPT_CONN | BT_LE_ADV_OPT_EXT_ADV,
+		BT_LE_ADV_OPT_CONN | BT_LE_ADV_OPT_EXT_ADV | BT_LE_ADV_OPT_USE_IDENTITY,
 		CONN_ADV_INTERVAL, CONN_ADV_INTERVAL, NULL);
 
 	ret = bt_le_ext_adv_create(&conn_param, NULL, &conn_adv);
