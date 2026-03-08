@@ -93,4 +93,13 @@ struct bt_conn *ble_adv_get_conn(void);
  */
 void ble_adv_nus_send(const char *msg);
 
+/**
+ * Send raw binary data over NUS (for file transfer).
+ * Sends in one call; caller must ensure len ≤ NUS MTU (≤240 bytes).
+ *
+ * @param data  Pointer to raw bytes
+ * @param len   Number of bytes to send
+ */
+void ble_adv_nus_send_raw(const uint8_t *data, uint16_t len);
+
 #endif /* BLE_ADV_H */

@@ -42,6 +42,8 @@
 
 LOG_MODULE_REGISTER(main, CONFIG_LOG_DEFAULT_LEVEL);
 
+#define FIRMWARE_VERSION "1.0.0"
+
 /* ─── Timing constants (spec section 12–13) ─── */
 #define IMU_PERIOD_US       9615    /* 1/104 Hz ≈ 9.615 ms */
 #define FAST_CYCLES         21      /* 104/5 ≈ 21 → ~5 Hz (BLE updates) */
@@ -324,6 +326,18 @@ static void process_command(const char *cmd)
 		/* Blue LED flash */
 		gpio_pin_set_dt(&led_blue, 1);
 		event_flash_off = k_uptime_get() + EVENT_FLASH_MS;
+	} else if (strcmp(cmd, "bat") == 0) {
+		char msg[32];
+		snprintf(msg, sizeof(msg), "BAT:%d.%02dV\n",
+			 battery_millivolts() / 1000,
+			 (battery_millivolts() % 1000) / 10);
+		ble_adv_nus_send(msg);
+	} else if (strcmp(cmd, "info") == 0) {
+		char msg[64];
+		snprintf(msg, sizeof(msg), "CoMotion v%s (Zephyr)\n", FIRMWARE_VERSION);
+		ble_adv_nus_send(msg);
+	} else if (strcmp(cmd, "ping") == 0) {
+		ble_adv_nus_send("pong\n");
 	} else if (strcmp(cmd, "focus") == 0) {
 		ble_adv_set_focus(true);
 		ble_adv_nus_send("OK:Focus mode ON (60s)\n");
@@ -344,6 +358,20 @@ static void process_command(const char *cmd)
 				g.hdop / 1000, (g.hdop % 1000) / 100,
 				g.update_count);
 		ble_adv_nus_send(buf);
+	} else if (strcmp(cmd, "LIST") == 0) {
+		sdcard_handle_list();
+	} else if (strncmp(cmd, "DUMP:", 5) == 0) {
+		sdcard_handle_dump(cmd + 5);
+	} else if (strcmp(cmd, "DUMP_LATEST") == 0) {
+		sdcard_handle_dump_latest();
+	} else if (strncmp(cmd, "DELETE:", 7) == 0) {
+		sdcard_handle_delete(cmd + 7);
+	} else if (strcmp(cmd, "STATUS") == 0) {
+		sdcard_handle_status_cmd();
+	} else if (strcmp(cmd, "ABORT") == 0) {
+		sdcard_handle_abort();
+	} else if (strncmp(cmd, "ACK:", 4) == 0) {
+		/* ACK from app during transfer — pacing handled in dump */
 	} else {
 		ble_adv_nus_send("ERR:Unknown command\n");
 	}

@@ -412,3 +412,25 @@ void ble_adv_nus_send(const char *msg)
 		}
 	}
 }
+
+void ble_adv_nus_send_raw(const uint8_t *data, uint16_t len)
+{
+	if (!connected || !current_conn || !data || len == 0) {
+		return;
+	}
+
+	int ret = -ENOMEM;
+
+	/* Retry up to 3 times on TX buffer full (-ENOMEM) */
+	for (int attempt = 0; attempt < 3; attempt++) {
+		ret = bt_nus_send(current_conn, data, len);
+		if (ret != -ENOMEM) {
+			break;
+		}
+		k_msleep(10);
+	}
+
+	if (ret) {
+		LOG_WRN("NUS raw send failed: %d (dropped %u bytes)", ret, len);
+	}
+}

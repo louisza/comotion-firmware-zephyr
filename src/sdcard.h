@@ -95,4 +95,12 @@ const char *sdcard_get_filename(void);
  */
 uint32_t sdcard_get_sample_count(void);
 
+/* ─── Log Transfer (NUS commands) ─── */
+void sdcard_handle_list(void);
+void sdcard_handle_dump(const char *filename);
+void sdcard_handle_dump_latest(void);
+void sdcard_handle_delete(const char *filename);
+void sdcard_handle_status_cmd(void);
+void sdcard_handle_abort(void);
+
 #endif /* SDCARD_H */
