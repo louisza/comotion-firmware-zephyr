@@ -393,7 +393,7 @@ void ble_adv_nus_send(const char *msg)
 	int off = 0;
 
 	while (off < len) {
-		int chunk = MIN(20, len - off);
+		int chunk = MIN(240, len - off);
 		int ret = -ENOMEM;
 
 		/* Retry up to 3 times on TX buffer full (-ENOMEM) */
