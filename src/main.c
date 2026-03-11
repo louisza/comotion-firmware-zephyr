@@ -593,6 +593,11 @@ static void build_ble_packet(struct ble_packet *pkt)
 static void format_and_log_csv(float ax, float ay, float az,
 			       float gx, float gy, float gz)
 {
+	static double last_lat, last_lng, last_lat_filt, last_lng_filt;
+	static float last_speed, last_course;
+	static uint32_t last_sats;
+	static bool have_last_gps;
+
 	char line[256];
 	int pos = 0;
 
@@ -617,19 +622,29 @@ static void format_and_log_csv(float ax, float ay, float az,
 			 && csv_gps.satellites >= 4;
 
 	if (csv_have_gps) {
-		double lat = (double)csv_gps.latitude_ndeg / 1e9;
-		double lng = (double)csv_gps.longitude_ndeg / 1e9;
-		double lat_filt = (double)csv_gps.latitude_filt_ndeg / 1e9;
-		double lng_filt = (double)csv_gps.longitude_filt_ndeg / 1e9;
-		float speed = (float)csv_gps.speed_mmps * 0.0036f;
-		float course = (float)csv_gps.bearing_mdeg / 1000.0f;
+		/* Fresh fix — update cache and log with stale=0 */
+		last_lat = (double)csv_gps.latitude_ndeg / 1e9;
+		last_lng = (double)csv_gps.longitude_ndeg / 1e9;
+		last_lat_filt = (double)csv_gps.latitude_filt_ndeg / 1e9;
+		last_lng_filt = (double)csv_gps.longitude_filt_ndeg / 1e9;
+		last_speed = (float)csv_gps.speed_mmps * 0.0036f;
+		last_course = (float)csv_gps.bearing_mdeg / 1000.0f;
+		last_sats = csv_gps.satellites;
+		have_last_gps = true;
 
 		pos += snprintf(line + pos, sizeof(line) - pos,
-				"%.6f,%.6f,%.6f,%.6f,%.1f,%.1f,%u,",
-				lat, lng, lat_filt, lng_filt, (double)speed, (double)course,
-				csv_gps.satellites);
+				"%.6f,%.6f,%.6f,%.6f,%.1f,%.1f,%u,0,",
+				last_lat, last_lng, last_lat_filt, last_lng_filt,
+				(double)last_speed, (double)last_course, last_sats);
+	} else if (have_last_gps) {
+		/* Stale — forward-fill last known position, stale=1 */
+		pos += snprintf(line + pos, sizeof(line) - pos,
+				"%.6f,%.6f,%.6f,%.6f,0.0,%.1f,%u,1,",
+				last_lat, last_lng, last_lat_filt, last_lng_filt,
+				(double)last_course, last_sats);
 	} else {
-		pos += snprintf(line + pos, sizeof(line) - pos, ",,,,,,");
+		/* No GPS ever — empty fields, stale=1 */
+		pos += snprintf(line + pos, sizeof(line) - pos, ",,,,,,,1,");
 	}
 
 	/* Audio: rms, peak, zcr */
