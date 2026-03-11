@@ -48,6 +48,7 @@ LOG_MODULE_REGISTER(main, CONFIG_LOG_DEFAULT_LEVEL);
 #define IMU_PERIOD_US       9615    /* 1/104 Hz ≈ 9.615 ms */
 #define FAST_CYCLES         21      /* 104/5 ≈ 21 → ~5 Hz (BLE updates) */
 #define SLOW_CYCLES         52      /* 104/2 = 52 → 2 Hz */
+#define LOG_CYCLES          10      /* 104/10 ≈ 10 → ~10 Hz SD card logging */
 #define BATT_CYCLES         3120    /* 104 × 30 = 3120 → every 30s */
 #define GPS_STALE_MS        2000    /* GPS fix older than this → stale (generous for jitter) */
 #define GYRO_CAL_TIMEOUT_MS 10000
@@ -825,8 +826,8 @@ int main(void)
 			}
 		}
 
-		/* ─── SD Logging at 104 Hz (if active) ─── */
-		if (sdcard_is_logging()) {
+		/* ─── SD Logging at ~10 Hz (every 10 cycles) ─── */
+		if (sdcard_is_logging() && (cycle % LOG_CYCLES) == 0) {
 			format_and_log_csv(ax_g, ay_g, az_g,
 					   gx_dps, gy_dps, gz_dps);
 		}
