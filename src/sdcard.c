@@ -22,6 +22,7 @@
 #include <string.h>
 
 #include "sdcard.h"
+#include "device_id.h"
 
 LOG_MODULE_REGISTER(sdcard, CONFIG_LOG_DEFAULT_LEVEL);
 
@@ -255,6 +256,11 @@ int sdcard_start_logging(void)
 	}
 
 	file_open = true;
+
+	/* Write metadata comment line with device identity */
+	char meta[80];
+	snprintf(meta, sizeof(meta), "# device_id=%s\n", device_id_full());
+	fs_write(&log_file, meta, strlen(meta));
 
 	/* Write CSV header */
 	ret = fs_write(&log_file, CSV_HEADER, strlen(CSV_HEADER));

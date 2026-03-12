@@ -28,6 +28,7 @@
 #include <stdio.h>
 
 #include "ble_adv.h"
+#include "device_id.h"
 
 LOG_MODULE_REGISTER(ble_adv, CONFIG_LOG_DEFAULT_LEVEL);
 
@@ -42,6 +43,10 @@ LOG_MODULE_REGISTER(ble_adv, CONFIG_LOG_DEFAULT_LEVEL);
 /* ─── Manufacturer data: 2-byte company ID + 27-byte payload ─── */
 static uint8_t mfg_data[2 + sizeof(struct ble_packet)];
 
+/* ─── Dynamic BLE name: "CoMotion-XXXX" (max 14 chars + NUL) ─── */
+static char ble_name[16] = "CoMotion";
+static uint8_t ble_name_len = 8;
+
 /* ─── Extended advertising sets ─── */
 static struct bt_le_ext_adv *bcast_adv;   /* Coded PHY broadcast */
 static struct bt_le_ext_adv *conn_adv;    /* 1M connectable for NUS */
@@ -51,10 +56,10 @@ static bool bcast_running;                /* true when broadcast set is active *
 /* No Flags — Flags SHALL NOT be present in non-connectable extended
  * advertising (BT Core Spec Vol 3, Part C, §11.1.3).
  * Device name IS included so the app can identify CoMotion broadcasts.
+ * Name data/len patched at init time with device ID suffix.
  */
 static struct bt_data bcast_ad[] = {
-	BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME,
-		sizeof(CONFIG_BT_DEVICE_NAME) - 1),
+	BT_DATA(BT_DATA_NAME_COMPLETE, ble_name, 8),
 	BT_DATA(BT_DATA_MANUFACTURER_DATA, mfg_data, sizeof(mfg_data)),
 };
 
@@ -62,8 +67,7 @@ static struct bt_data bcast_ad[] = {
 static struct bt_data conn_ad_data[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS,
 		      (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
-	BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME,
-		sizeof(CONFIG_BT_DEVICE_NAME) - 1),
+	BT_DATA(BT_DATA_NAME_COMPLETE, ble_name, 8),
 	BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_NUS_VAL),
 };
 
@@ -233,6 +237,19 @@ int ble_adv_init(void (*rx_cb)(struct bt_conn *, const uint8_t *, uint16_t))
 	mfg_data[0] = MFG_ID_LOW;
 	mfg_data[1] = MFG_ID_HIGH;
 	memset(&mfg_data[2], 0, sizeof(struct ble_packet));
+
+	/* Build dynamic BLE name: "CoMotion-XXXX" using device ID */
+	snprintf(ble_name, sizeof(ble_name), "CoMotion-%s", device_id_short());
+	ble_name_len = strlen(ble_name);
+
+	/* Patch advertising data structs with actual name length */
+	bcast_ad[0].data_len = ble_name_len;
+	conn_ad_data[1].data_len = ble_name_len;
+
+	/* Also set the GAP device name so connected clients see it */
+	bt_set_name(ble_name);
+
+	LOG_INF("BLE name: %s", ble_name);
 
 	/* Enable Bluetooth */
 	ret = bt_enable(NULL);

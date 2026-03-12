@@ -39,6 +39,7 @@
 #include "gps.h"
 #include "battery.h"
 #include "filter.h"
+#include "device_id.h"
 
 LOG_MODULE_REGISTER(main, CONFIG_LOG_DEFAULT_LEVEL);
 
@@ -335,7 +336,8 @@ static void process_command(const char *cmd)
 		ble_adv_nus_send(msg);
 	} else if (strcmp(cmd, "info") == 0) {
 		char msg[64];
-		snprintf(msg, sizeof(msg), "CoMotion v%s (Zephyr)\n", FIRMWARE_VERSION);
+		snprintf(msg, sizeof(msg), "CoMotion v%s [%s] (Zephyr)\n",
+			 FIRMWARE_VERSION, device_id_full());
 		ble_adv_nus_send(msg);
 	} else if (strcmp(cmd, "ping") == 0) {
 		ble_adv_nus_send("pong\n");
@@ -739,6 +741,10 @@ int main(void)
 	} else {
 		printk("[OK] Audio (PDM 16kHz, 10Hz processing)\n");
 	}
+
+	/* --- Device Identity (must be before BLE and SD card) --- */
+	device_id_init();
+	printk("[OK] Device ID: %s (short: %s)\n", device_id_full(), device_id_short());
 
 	/* --- SD Card --- */
 	ret = sdcard_init();

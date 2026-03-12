@@ -11,4 +11,5 @@ target_sources(app PRIVATE
   src/intensity.c
   src/impact.c
   src/ble_adv.c
+  src/device_id.c
 )
