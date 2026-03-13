@@ -34,6 +34,6 @@ const char *device_id_short(void);
 /**
  * Get the raw 4-byte device ID value.
  */
-uint32_t device_id_raw(void);
+uint32_t device_id_raw_value(void);
 
 #endif /* DEVICE_ID_H */

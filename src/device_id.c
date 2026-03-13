@@ -61,7 +61,7 @@ const char *device_id_short(void)
 	return dev_id_short_str;
 }
 
-uint32_t device_id_raw(void)
+uint32_t device_id_raw_value(void)
 {
 	return dev_id_raw;
 }

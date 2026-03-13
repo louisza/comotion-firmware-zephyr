@@ -256,18 +256,7 @@ static void process_command(const char *cmd)
 {
 	LOG_INF("NUS CMD: \"%s\"", cmd);
 
-	if (strcmp(cmd, "ping") == 0) {
-		ble_adv_nus_send("pong\n");
-	} else if (strcmp(cmd, "info") == 0) {
-		ble_adv_nus_send("CoMotion v2.0.0\n");
-	} else if (strcmp(cmd, "bat") == 0) {
-		char buf[32];
-
-		snprintf(buf, sizeof(buf), "BAT:%d.%02dV\n",
-			 battery_millivolts() / 1000,
-			 (battery_millivolts() % 1000) / 10);
-		ble_adv_nus_send(buf);
-	} else if (strcmp(cmd, "start") == 0) {
+	if (strcmp(cmd, "start") == 0) {
 		if (sdcard_is_logging()) {
 			ble_adv_nus_send("ERR:Already logging\n");
 			return;
