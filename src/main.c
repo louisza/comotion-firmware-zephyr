@@ -577,6 +577,10 @@ static void build_ble_packet(struct ble_packet *pkt)
 	if (gps_ok) {
 		pkt->fix_quality = gps.fix_quality;
 	}
+
+	/* Rolling sequence number (0-255, wraps) — app uses to detect dropped packets */
+	static uint8_t seq_counter;
+	pkt->seq = seq_counter++;
 }
 
 /* ─── CSV Line Formatter (spec section 8, called at 104 Hz if logging) ─── */

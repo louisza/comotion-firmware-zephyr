@@ -42,6 +42,7 @@ struct ble_packet {
 	uint16_t bearing;         /* Byte 23-24: LE, ×10 (0–3600 = 0.0–360.0°) */
 	uint8_t  hdop;            /* Byte 25: ×10 (0–255 = 0.0–25.5 HDOP) */
 	uint8_t  fix_quality;     /* Byte 26: 0=none,1=SPS,2=DGNSS,3=PPS,4=RTK */
+	uint8_t  seq;             /* Byte 27: rolling sequence number (0-255) */
 } __packed;
 
 /* Status flag bits */
