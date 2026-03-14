@@ -62,8 +62,8 @@ static bool writer_running;
 static struct fs_file_t log_file;
 static bool file_open;
 static bool logging;
-static char log_path[32];
-static char log_filename[16];   /* e.g., "LOG042.CSV" */
+static char log_path[48];
+static char log_filename[24];   /* e.g., "A3F7_LOG042.CSV" */
 static uint32_t sample_count;
 
 /* ─── Event Tagging ─── */
@@ -78,7 +78,7 @@ static uint8_t flush_buf[SD_BUFFER_SIZE];
 
 /* ─── Transfer state ─── */
 static volatile bool transfer_abort;
-static char last_log_filename[32];
+static char last_log_filename[48];
 
 /* ─── Helpers ─── */
 
@@ -96,7 +96,11 @@ static int find_next_session(void)
 	while (fs_readdir(&dir, &entry) == 0 && entry.name[0] != '\0') {
 		int num;
 
-		if (sscanf(entry.name, "LOG%d.CSV", &num) == 1 ||
+		/* Match new format: XXXX_LOG###.CSV */
+		if (sscanf(entry.name, "%*[A-Fa-f0-9]_LOG%d.CSV", &num) == 1 ||
+		    sscanf(entry.name, "%*[A-Fa-f0-9]_log%d.csv", &num) == 1 ||
+		    /* Legacy format: LOG###.CSV */
+		    sscanf(entry.name, "LOG%d.CSV", &num) == 1 ||
 		    sscanf(entry.name, "log%d.csv", &num) == 1) {
 			if (num > max_num) {
 				max_num = num;
@@ -251,7 +255,8 @@ int sdcard_start_logging(void)
 		return -ENOSPC;
 	}
 
-	snprintf(log_filename, sizeof(log_filename), "LOG%03d.CSV", session);
+	snprintf(log_filename, sizeof(log_filename), "%s_LOG%03d.CSV",
+		 device_id_short(), session);
 	snprintf(log_path, sizeof(log_path), MOUNT_POINT "/%s", log_filename);
 
 	/* Open file */
