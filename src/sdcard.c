@@ -70,6 +70,9 @@ static uint32_t sample_count;
 static char event_tag[32];
 static bool event_pending;
 
+/* ─── Player name (set via NUS NAME: command, persisted to player.txt) ─── */
+static char player_name[32] = "";
+
 /* ─── Flush buffer (outside ring for SD write) ─── */
 static uint8_t flush_buf[SD_BUFFER_SIZE];
 
@@ -208,6 +211,9 @@ int sdcard_init(void)
 	mounted = true;
 	LOG_INF("SD: FAT filesystem mounted at %s", MOUNT_POINT);
 
+	/* Load persisted player name */
+	load_player_name();
+
 	/* Start writer thread */
 	writer_running = true;
 	k_thread_create(&sd_writer_thread, sd_writer_stack,
@@ -257,9 +263,14 @@ int sdcard_start_logging(void)
 
 	file_open = true;
 
-	/* Write metadata comment line with device identity */
-	char meta[80];
-	snprintf(meta, sizeof(meta), "# device_id=%s\n", device_id_full());
+	/* Write metadata comment line with device identity and player name */
+	char meta[128];
+	int mpos = snprintf(meta, sizeof(meta), "# device_id=%s", device_id_full());
+	if (player_name[0] != '\0') {
+		mpos += snprintf(meta + mpos, sizeof(meta) - mpos,
+				 ",player_name=%s", player_name);
+	}
+	snprintf(meta + mpos, sizeof(meta) - mpos, "\n");
 	fs_write(&log_file, meta, strlen(meta));
 
 	/* Write CSV header */
@@ -662,4 +673,91 @@ void sdcard_handle_status_cmd(void)
 void sdcard_handle_abort(void)
 {
 	transfer_abort = true;
+}
+
+/* ─── Player Name Persistence ─── */
+
+#define PLAYER_NAME_PATH MOUNT_POINT "/player.txt"
+#define AUTOSTART_PATH   MOUNT_POINT "/autostart.txt"
+
+static void load_player_name(void)
+{
+	struct fs_file_t f;
+	int ret;
+
+	fs_file_t_init(&f);
+	ret = fs_open(&f, PLAYER_NAME_PATH, FS_O_READ);
+	if (ret == 0) {
+		ssize_t n = fs_read(&f, player_name, sizeof(player_name) - 1);
+		if (n > 0) {
+			player_name[n] = '\0';
+			/* Strip trailing whitespace */
+			while (n > 0 && (player_name[n-1] == '\n' ||
+					 player_name[n-1] == '\r' ||
+					 player_name[n-1] == ' ')) {
+				player_name[--n] = '\0';
+			}
+			LOG_INF("Player name loaded: %s", player_name);
+		}
+		fs_close(&f);
+	}
+}
+
+void sdcard_set_player_name(const char *name)
+{
+	struct fs_file_t f;
+
+	strncpy(player_name, name, sizeof(player_name) - 1);
+	player_name[sizeof(player_name) - 1] = '\0';
+
+	/* Strip trailing whitespace */
+	int len = strlen(player_name);
+	while (len > 0 && (player_name[len-1] == '\n' ||
+			   player_name[len-1] == '\r' ||
+			   player_name[len-1] == ' ')) {
+		player_name[--len] = '\0';
+	}
+
+	/* Persist to SD */
+	fs_file_t_init(&f);
+	if (fs_open(&f, PLAYER_NAME_PATH, FS_O_CREATE | FS_O_WRITE) == 0) {
+		fs_write(&f, player_name, strlen(player_name));
+		fs_close(&f);
+		LOG_INF("Player name saved: %s", player_name);
+	}
+}
+
+const char *sdcard_get_player_name(void)
+{
+	return player_name;
+}
+
+bool sdcard_get_autostart(void)
+{
+	struct fs_file_t f;
+
+	if (!mounted) return false;
+
+	fs_file_t_init(&f);
+	if (fs_open(&f, AUTOSTART_PATH, FS_O_READ) == 0) {
+		char buf[2] = {0};
+		fs_read(&f, buf, 1);
+		fs_close(&f);
+		return buf[0] == '1';
+	}
+	return false;
+}
+
+void sdcard_set_autostart(bool enabled)
+{
+	struct fs_file_t f;
+
+	if (!mounted) return;
+
+	fs_file_t_init(&f);
+	if (fs_open(&f, AUTOSTART_PATH, FS_O_CREATE | FS_O_WRITE) == 0) {
+		fs_write(&f, enabled ? "1" : "0", 1);
+		fs_close(&f);
+		LOG_INF("Auto-start %s", enabled ? "enabled" : "disabled");
+	}
 }

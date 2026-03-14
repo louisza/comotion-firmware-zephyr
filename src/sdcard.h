@@ -103,4 +103,28 @@ void sdcard_handle_delete(const char *filename);
 void sdcard_handle_status_cmd(void);
 void sdcard_handle_abort(void);
 
+/* ─── Player Name (persisted to SD card) ─── */
+
+/**
+ * Set the player name (from NUS NAME: command).
+ * Persists to /SD:/player.txt for survival across resets.
+ */
+void sdcard_set_player_name(const char *name);
+
+/**
+ * Get the current player name. Returns "" if unset.
+ */
+const char *sdcard_get_player_name(void);
+
+/**
+ * Check if auto-start flag is set (device should log on boot).
+ * Flag is stored in /SD:/autostart.txt.
+ */
+bool sdcard_get_autostart(void);
+
+/**
+ * Set or clear the auto-start flag.
+ */
+void sdcard_set_autostart(bool enabled);
+
 #endif /* SDCARD_H */

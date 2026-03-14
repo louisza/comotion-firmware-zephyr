@@ -46,10 +46,14 @@ struct gps_data {
 	uint32_t speed_filt_mmps;  /* Kalman-filtered speed (mm/s)           */
 	uint32_t bearing_filt_mdeg;/* circular-EMA-filtered bearing (mdeg)   */
 
-	/* UTC time (from latest NMEA sentence, valid even without fix) */
+	/* UTC date+time (from latest NMEA sentence, valid even without fix) */
+	uint16_t year;     /* e.g. 2026 */
+	uint8_t  month;    /* 1-12 */
+	uint8_t  day;      /* 1-31 */
 	uint8_t  hour;
 	uint8_t  minute;
 	uint8_t  second;
+	bool     time_valid; /* true once we've received at least one UTC time */
 
 	/* Timing — kernel uptime in ms, 0 means "never" */
 	int64_t  last_fix_ms;      /* when last VALID fix was received        */

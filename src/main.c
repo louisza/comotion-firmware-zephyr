@@ -364,6 +364,18 @@ static void process_command(const char *cmd)
 		sdcard_handle_abort();
 	} else if (strncmp(cmd, "ACK:", 4) == 0) {
 		/* ACK from app during transfer — pacing handled in dump */
+	} else if (strncmp(cmd, "NAME:", 5) == 0) {
+		sdcard_set_player_name(cmd + 5);
+		char buf[64];
+		snprintf(buf, sizeof(buf), "OK:Name set to %s",
+			 sdcard_get_player_name());
+		ble_adv_nus_send(buf);
+	} else if (strcmp(cmd, "autostart_on") == 0) {
+		sdcard_set_autostart(true);
+		ble_adv_nus_send("OK:Auto-start enabled");
+	} else if (strcmp(cmd, "autostart_off") == 0) {
+		sdcard_set_autostart(false);
+		ble_adv_nus_send("OK:Auto-start disabled");
 	} else {
 		ble_adv_nus_send("ERR:Unknown command\n");
 	}
@@ -597,8 +609,19 @@ static void format_and_log_csv(float ax, float ay, float az,
 	int pos = 0;
 
 	/* timestamp (ms since boot) */
-	pos += snprintf(line + pos, sizeof(line) - pos, "%u,",
-			(uint32_t)k_uptime_get());
+	/* Timestamp: prefer ISO 8601 UTC from GPS, fallback to uptime ms */
+	struct gps_data ts_gps = {0};
+	bool ts_ok = (gps_get_data(&ts_gps) == 0) && ts_gps.time_valid;
+	if (ts_ok) {
+		/* ISO 8601: 2026-03-14T14:30:05Z */
+		pos += snprintf(line + pos, sizeof(line) - pos,
+				"%04u-%02u-%02uT%02u:%02u:%02uZ,",
+				ts_gps.year, ts_gps.month, ts_gps.day,
+				ts_gps.hour, ts_gps.minute, ts_gps.second);
+	} else {
+		pos += snprintf(line + pos, sizeof(line) - pos, "%u,",
+				(uint32_t)k_uptime_get());
+	}
 
 	/* IMU: accel (g, 4dp), gyro (dps, 2dp) */
 	pos += snprintf(line + pos, sizeof(line) - pos,
@@ -766,6 +789,21 @@ int main(void)
 
 	/* Boot complete — turn off blue LED */
 	gpio_pin_set_dt(&led_blue, 0);
+
+	/* ─── Auto-start logging if flag is set ─── */
+	if (sdcard_is_mounted() && sdcard_get_autostart()) {
+		printk("[AUTO] Auto-start enabled — starting logging\n");
+		intensity_reset();
+		impact_reset();
+		max_speed_kmh = 0;
+		log_start_time = k_uptime_get();
+		int asr = sdcard_start_logging();
+		if (asr == 0) {
+			printk("[AUTO] Logging started: %s\n", sdcard_get_filename());
+		} else {
+			printk("[AUTO] Failed to start logging: %d\n", asr);
+		}
+	}
 
 	printk("\n--- Running at 104 Hz ---\n\n");
 

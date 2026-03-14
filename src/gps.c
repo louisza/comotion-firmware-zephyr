@@ -249,6 +249,12 @@ static void gnss_data_cb(const struct device *dev, const struct gnss_data *data)
 	latest.hour         = data->utc.hour;
 	latest.minute       = data->utc.minute;
 	latest.second       = (uint8_t)(data->utc.millisecond / 1000);
+	latest.year         = 2000 + data->utc.century_year;
+	latest.month        = data->utc.month;
+	latest.day          = data->utc.month_day;
+	latest.time_valid   = (data->utc.hour > 0 || data->utc.minute > 0
+			       || data->utc.millisecond > 0
+			       || data->utc.month > 0);
 	latest.update_count++;
 	latest.last_update_ms = now;
 
