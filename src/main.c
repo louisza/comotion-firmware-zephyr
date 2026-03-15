@@ -376,6 +376,13 @@ static void process_command(const char *cmd)
 	} else if (strcmp(cmd, "autostart_off") == 0) {
 		sdcard_set_autostart(false);
 		ble_adv_nus_send("OK:Auto-start disabled");
+	} else if (strncmp(cmd, "PHASE:", 6) == 0) {
+		const char *phase = cmd + 6;
+		LOG_INF("Match phase: %s", phase);
+		sdcard_mark_event(phase);
+		char buf[64];
+		snprintf(buf, sizeof(buf), "OK:Phase %s", phase);
+		ble_adv_nus_send(buf);
 	} else {
 		ble_adv_nus_send("ERR:Unknown command\n");
 	}
