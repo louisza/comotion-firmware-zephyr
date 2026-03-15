@@ -516,7 +516,11 @@ void sdcard_handle_list(void)
 		/* Only list .CSV files */
 		int nlen = strlen(entry.name);
 		if (nlen < 5) continue;
-		if (strcasecmp(&entry.name[nlen - 4], ".CSV") != 0) continue;
+		const char *ext = &entry.name[nlen - 4];
+		if (!((ext[0] == '.' || ext[0] == '.') &&
+		      (ext[1] == 'C' || ext[1] == 'c') &&
+		      (ext[2] == 'S' || ext[2] == 's') &&
+		      (ext[3] == 'V' || ext[3] == 'v'))) continue;
 
 		/* Scan for timestamps */
 		char fullpath[48];
