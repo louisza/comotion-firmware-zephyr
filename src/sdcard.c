@@ -261,7 +261,8 @@ int sdcard_start_logging(void)
 		 device_id_short(), session);
 	snprintf(log_path, sizeof(log_path), MOUNT_POINT "/%s", log_filename);
 
-	/* Open file */
+	/* Open file (re-init handle — required after any prior close) */
+	fs_file_t_init(&log_file);
 	ret = fs_open(&log_file, log_path, FS_O_CREATE | FS_O_WRITE);
 	if (ret) {
 		LOG_ERR("SD: cannot open %s: %d", log_path, ret);
