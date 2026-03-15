@@ -62,6 +62,7 @@ static bool writer_running;
 static struct fs_file_t log_file;
 static bool file_open;
 static bool logging;
+static void load_player_name(void);
 static char log_path[48];
 static char log_filename[24];   /* e.g., "A3F7_LOG042.CSV" */
 static uint32_t sample_count;
