@@ -20,6 +20,7 @@
 #include <zephyr/logging/log.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 #include "sdcard.h"
 #include "device_id.h"
@@ -668,7 +669,12 @@ void sdcard_handle_status_cmd(void)
 		struct fs_dirent entry;
 		while (fs_readdir(&dir, &entry) == 0 && entry.name[0] != '\0') {
 			int nlen = strlen(entry.name);
-			if (nlen >= 5 && strcasecmp(&entry.name[nlen - 4], ".CSV") == 0) {
+			const char *e = &entry.name[nlen - 4];
+			if (nlen >= 5 &&
+			    e[0] == '.' &&
+			    (e[1] == 'C' || e[1] == 'c') &&
+			    (e[2] == 'S' || e[2] == 's') &&
+			    (e[3] == 'V' || e[3] == 'v')) {
 				file_count++;
 			}
 		}
